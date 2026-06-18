@@ -1,0 +1,17 @@
+[package]
+name = "strfry-ratelimit"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A strfry writePolicy plugin: per-pubkey rate limiting with auto-ban, kind-class aware"
+repository = "https://github.com/kojira/strfry-ratelimit"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+lto = true
+opt-level = 3
+codegen-units = 1
+panic = "abort"
