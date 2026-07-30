@@ -42,6 +42,18 @@ struct Config {
 fn mtime(path: &str) -> Option<std::time::SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
+/// Strip a trailing `# comment`. `#` only starts a comment at line start or after whitespace, so a
+/// `#` inside a value (e.g. a file path) is preserved.
+fn strip_comment(line: &str) -> &str {
+    let mut prev_ws = true; // start of line counts as "preceded by whitespace"
+    for (i, b) in line.bytes().enumerate() {
+        if b == b'#' && prev_ws {
+            return &line[..i];
+        }
+        prev_ws = b == b' ' || b == b'\t';
+    }
+    line
+}
 /// Parse a kind spec like "20001, 22000-22999" into (single kinds, inclusive ranges).
 fn parse_kind_list(spec: &str) -> (Vec<u64>, Vec<(u64, u64)>) {
     let (mut singles, mut ranges) = (Vec::new(), Vec::new());
@@ -98,26 +110,26 @@ impl Config {
     fn from_env() -> Self {
         Self::from_lookup(|k| std::env::var(format!("RL_{}", k.to_ascii_uppercase())).ok())
     }
-    /// Config from a `key = value` file. `#` starts a comment; blank lines and unknown keys are
-    /// ignored. Keys are the generic names (e.g. `window_seconds`, `block_kinds`).
-    fn from_file(path: &str) -> Self {
+    /// Config from a `key = value` file, or `None` if the file can't be read or is empty/whitespace
+    /// (e.g. a transient truncation while an editor rewrites it) — the caller then keeps its
+    /// last-good config instead of reverting to defaults. `#` starts a comment; blank lines and
+    /// unknown keys are ignored. Keys are the generic names (e.g. `window_seconds`, `block_kinds`).
+    fn from_file(path: &str) -> Option<Config> {
+        let txt = std::fs::read_to_string(path).ok()?;
+        if txt.trim().is_empty() {
+            return None;
+        }
         let mut map: HashMap<String, String> = HashMap::new();
-        if let Ok(txt) = std::fs::read_to_string(path) {
-            for line in txt.lines() {
-                let line = match line.split_once('#') {
-                    Some((code, _)) => code,
-                    None => line,
-                }
-                .trim();
-                if line.is_empty() {
-                    continue;
-                }
-                if let Some((k, v)) = line.split_once('=') {
-                    map.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
-                }
+        for line in txt.lines() {
+            let line = strip_comment(line).trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some((k, v)) = line.split_once('=') {
+                map.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
             }
         }
-        Self::from_lookup(|k| map.get(k).cloned())
+        Some(Self::from_lookup(|k| map.get(k).cloned()))
     }
     fn is_blocked(&self, kind: u64) -> bool {
         self.block_singles.iter().any(|&k| k == kind)
@@ -199,8 +211,11 @@ fn load_banlist(path: &str) -> HashSet<String> {
     set
 }
 fn append_ban(path: &str, pubkey: &str) {
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(f, "{pubkey}");
+    match OpenOptions::new().create(true).append(true).open(path) {
+        Ok(mut f) => {
+            let _ = writeln!(f, "{pubkey}");
+        }
+        Err(e) => eprintln!("strfry-ratelimit: failed to persist ban for {pubkey} to {path}: {e}"),
     }
 }
 
@@ -222,7 +237,10 @@ fn main() {
     // environment variables (read once at startup — fully backward compatible).
     let cfg_path = std::env::var("RL_CONFIG_FILE").ok().filter(|s| !s.is_empty());
     let mut cfg = match &cfg_path {
-        Some(p) => Config::from_file(p),
+        Some(p) => Config::from_file(p).unwrap_or_else(|| {
+            eprintln!("strfry-ratelimit: config file {p} unreadable/empty at startup; using defaults");
+            Config::from_lookup(|_| None)
+        }),
         None => Config::from_env(),
     };
     let mut cfg_mtime = cfg_path.as_deref().and_then(mtime);
@@ -267,14 +285,17 @@ fn main() {
                 // vanishes (mtime None, e.g. a delete-then-write editor), keep the last good
                 // config instead of silently reverting every setting to its default.
                 if m.is_some() && m != cfg_mtime {
-                    cfg = Config::from_file(p);
-                    cfg_mtime = m;
-                    if cfg.ban_list_file != ban_path {
-                        ban_path = cfg.ban_list_file.clone();
-                        banned = ban_path.as_deref().map(load_banlist).unwrap_or_default();
-                        ban_mtime = ban_path.as_deref().and_then(mtime);
+                    if let Some(new_cfg) = Config::from_file(p) {
+                        cfg = new_cfg;
+                        cfg_mtime = m; // commit only on a successful (non-empty) read
+                        if cfg.ban_list_file != ban_path {
+                            ban_path = cfg.ban_list_file.clone();
+                            banned = ban_path.as_deref().map(load_banlist).unwrap_or_default();
+                            ban_mtime = ban_path.as_deref().and_then(mtime);
+                        }
+                        eprintln!("strfry-ratelimit: reloaded config from {p}");
                     }
-                    eprintln!("strfry-ratelimit: reloaded config from {p}");
+                    // read failed / empty (e.g. mid-write): keep last-good config and retry later.
                 }
             }
             if let Some(p) = &ban_path {
