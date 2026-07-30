@@ -263,7 +263,10 @@ fn main() {
         if tick % 64 == 0 {
             if let Some(p) = &cfg_path {
                 let m = mtime(p);
-                if m != cfg_mtime {
+                // Only reload when the file still exists and actually changed. If it briefly
+                // vanishes (mtime None, e.g. a delete-then-write editor), keep the last good
+                // config instead of silently reverting every setting to its default.
+                if m.is_some() && m != cfg_mtime {
                     cfg = Config::from_file(p);
                     cfg_mtime = m;
                     if cfg.ban_list_file != ban_path {
@@ -276,7 +279,7 @@ fn main() {
             }
             if let Some(p) = &ban_path {
                 let m = mtime(p);
-                if m != ban_mtime {
+                if m.is_some() && m != ban_mtime {
                     banned = load_banlist(p);
                     ban_mtime = m;
                 }
