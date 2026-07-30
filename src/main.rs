@@ -37,20 +37,22 @@ struct Config {
     block_ranges: Vec<(u64, u64)>,
 }
 
-fn env_u64(key: &str, default: u64) -> u64 {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+/// File modification time, or None if the path is unset/unreadable. Used to detect edits to the
+/// config file and banlist file so they can be reloaded without restarting.
+fn mtime(path: &str) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
-fn env_bool(key: &str, default: bool) -> bool {
-    match std::env::var(key) {
-        Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
-        Err(_) => default,
+/// Strip a trailing `# comment`. `#` only starts a comment at line start or after whitespace, so a
+/// `#` inside a value (e.g. a file path) is preserved.
+fn strip_comment(line: &str) -> &str {
+    let mut prev_ws = true; // start of line counts as "preceded by whitespace"
+    for (i, b) in line.bytes().enumerate() {
+        if b == b'#' && prev_ws {
+            return &line[..i];
+        }
+        prev_ws = b == b' ' || b == b'\t';
     }
-}
-fn env_kinds(key: &str, default: &[u64]) -> HashSet<u64> {
-    match std::env::var(key) {
-        Ok(v) => v.split(',').filter_map(|s| s.trim().parse().ok()).collect(),
-        Err(_) => default.iter().copied().collect(),
-    }
+    line
 }
 /// Parse a kind spec like "20001, 22000-22999" into (single kinds, inclusive ranges).
 fn parse_kind_list(spec: &str) -> (Vec<u64>, Vec<(u64, u64)>) {
@@ -75,22 +77,59 @@ fn parse_kind_list(spec: &str) -> (Vec<u64>, Vec<(u64, u64)>) {
 }
 
 impl Config {
-    fn from_env() -> Self {
-        let (block_singles, block_ranges) =
-            parse_kind_list(&std::env::var("RL_BLOCK_KINDS").unwrap_or_default());
+    /// Build from a key lookup. `get("window_seconds")` returns the raw value if set. This backs
+    /// both env vars and the optional config file, so both share one set of parsing and defaults.
+    fn from_lookup<F: Fn(&str) -> Option<String>>(get: F) -> Self {
+        let u64_of = |k: &str, d: u64| get(k).and_then(|v| v.trim().parse().ok()).unwrap_or(d);
+        let bool_of = |k: &str, d: bool| {
+            get(k)
+                .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+                .unwrap_or(d)
+        };
+        let kinds_of = |k: &str, d: &[u64]| -> HashSet<u64> {
+            get(k)
+                .map(|v| v.split(',').filter_map(|s| s.trim().parse().ok()).collect())
+                .unwrap_or_else(|| d.iter().copied().collect())
+        };
+        let (block_singles, block_ranges) = parse_kind_list(&get("block_kinds").unwrap_or_default());
         Config {
-            window_seconds: env_u64("RL_WINDOW_SECONDS", 60),
-            max_events: env_u64("RL_MAX_EVENTS", 10),
-            mode_shadow: std::env::var("RL_MODE").map(|m| m == "shadow").unwrap_or(false),
-            ban_on_exceed: env_bool("RL_BAN_ON_EXCEED", false),
-            ban_list_file: std::env::var("RL_BAN_LIST_FILE").ok().filter(|s| !s.is_empty()),
-            exclude_kinds: env_kinds("RL_EXCLUDE_KINDS", &[7]),
-            exempt_ephemeral: env_bool("RL_EXEMPT_EPHEMERAL", true),
-            exempt_replaceable: env_bool("RL_EXEMPT_REPLACEABLE", true),
-            exempt_addressable: env_bool("RL_EXEMPT_ADDRESSABLE", false),
+            window_seconds: u64_of("window_seconds", 60),
+            max_events: u64_of("max_events", 10),
+            mode_shadow: get("mode").map(|m| m.trim() == "shadow").unwrap_or(false),
+            ban_on_exceed: bool_of("ban_on_exceed", false),
+            ban_list_file: get("ban_list_file").filter(|s| !s.is_empty()),
+            exclude_kinds: kinds_of("exclude_kinds", &[7]),
+            exempt_ephemeral: bool_of("exempt_ephemeral", true),
+            exempt_replaceable: bool_of("exempt_replaceable", true),
+            exempt_addressable: bool_of("exempt_addressable", false),
             block_singles,
             block_ranges,
         }
+    }
+    /// Config from environment variables: generic key `foo_bar` reads env `RL_FOO_BAR`.
+    fn from_env() -> Self {
+        Self::from_lookup(|k| std::env::var(format!("RL_{}", k.to_ascii_uppercase())).ok())
+    }
+    /// Config from a `key = value` file, or `None` if the file can't be read or is empty/whitespace
+    /// (e.g. a transient truncation while an editor rewrites it) — the caller then keeps its
+    /// last-good config instead of reverting to defaults. `#` starts a comment; blank lines and
+    /// unknown keys are ignored. Keys are the generic names (e.g. `window_seconds`, `block_kinds`).
+    fn from_file(path: &str) -> Option<Config> {
+        let txt = std::fs::read_to_string(path).ok()?;
+        if txt.trim().is_empty() {
+            return None;
+        }
+        let mut map: HashMap<String, String> = HashMap::new();
+        for line in txt.lines() {
+            let line = strip_comment(line).trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some((k, v)) = line.split_once('=') {
+                map.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+            }
+        }
+        Some(Self::from_lookup(|k| map.get(k).cloned()))
     }
     fn is_blocked(&self, kind: u64) -> bool {
         self.block_singles.iter().any(|&k| k == kind)
@@ -172,8 +211,11 @@ fn load_banlist(path: &str) -> HashSet<String> {
     set
 }
 fn append_ban(path: &str, pubkey: &str) {
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(f, "{pubkey}");
+    match OpenOptions::new().create(true).append(true).open(path) {
+        Ok(mut f) => {
+            let _ = writeln!(f, "{pubkey}");
+        }
+        Err(e) => eprintln!("strfry-ratelimit: failed to persist ban for {pubkey} to {path}: {e}"),
     }
 }
 
@@ -191,15 +233,31 @@ fn respond(out: &mut impl Write, id: &[u8], action: &str, msg: &str) {
 }
 
 fn main() {
-    let cfg = Config::from_env();
-    let mut banned: HashSet<String> =
-        cfg.ban_list_file.as_ref().map(|p| load_banlist(p)).unwrap_or_default();
+    // Config from a file if RL_CONFIG_FILE is set (hot-reloaded on mtime change), else from
+    // environment variables (read once at startup — fully backward compatible).
+    let cfg_path = std::env::var("RL_CONFIG_FILE").ok().filter(|s| !s.is_empty());
+    let mut cfg = match &cfg_path {
+        Some(p) => Config::from_file(p).unwrap_or_else(|| {
+            eprintln!("strfry-ratelimit: config file {p} unreadable/empty at startup; using defaults");
+            Config::from_lookup(|_| None)
+        }),
+        None => Config::from_env(),
+    };
+    let mut cfg_mtime = cfg_path.as_deref().and_then(mtime);
+
+    // Banlist is loaded from cfg.ban_list_file and also hot-reloaded on its own mtime change, so
+    // manual edits (unbans/bans) take effect without a restart.
+    let mut ban_path = cfg.ban_list_file.clone();
+    let mut banned: HashSet<String> = ban_path.as_deref().map(load_banlist).unwrap_or_default();
+    let mut ban_mtime = ban_path.as_deref().and_then(mtime);
+
     let mut buckets: HashMap<String, VecDeque<u64>> = HashMap::new();
 
     eprintln!(
-        "strfry-ratelimit: window={}s max={} banOnExceed={} blockSingles={:?} blockRanges={:?} excludeKinds={:?} exempt(eph={},repl={},addr={}) banned_loaded={}",
-        cfg.window_seconds, cfg.max_events, cfg.ban_on_exceed, cfg.block_singles, cfg.block_ranges,
-        cfg.exclude_kinds, cfg.exempt_ephemeral, cfg.exempt_replaceable, cfg.exempt_addressable, banned.len()
+        "strfry-ratelimit: source={} window={}s max={} banOnExceed={} blockSingles={:?} blockRanges={:?} excludeKinds={:?} exempt(eph={},repl={},addr={}) banned_loaded={}",
+        cfg_path.as_deref().unwrap_or("env"), cfg.window_seconds, cfg.max_events, cfg.ban_on_exceed,
+        cfg.block_singles, cfg.block_ranges, cfg.exclude_kinds, cfg.exempt_ephemeral,
+        cfg.exempt_replaceable, cfg.exempt_addressable, banned.len()
     );
 
     let stdin = io::stdin();
@@ -208,6 +266,7 @@ fn main() {
     let mut out = io::BufWriter::new(stdout.lock());
     let mut line: Vec<u8> = Vec::with_capacity(8192);
     let mut processed: u64 = 0;
+    let mut tick: u64 = 0;
 
     loop {
         line.clear();
@@ -216,6 +275,38 @@ fn main() {
             Ok(_) => {}
             Err(_) => break,
         }
+        // Hot-reload config + banlist periodically (throttled; a cheap mtime stat, no re-read
+        // unless the file actually changed). In-memory rate-limit state is preserved across reloads.
+        tick = tick.wrapping_add(1);
+        if tick % 64 == 0 {
+            if let Some(p) = &cfg_path {
+                let m = mtime(p);
+                // Only reload when the file still exists and actually changed. If it briefly
+                // vanishes (mtime None, e.g. a delete-then-write editor), keep the last good
+                // config instead of silently reverting every setting to its default.
+                if m.is_some() && m != cfg_mtime {
+                    if let Some(new_cfg) = Config::from_file(p) {
+                        cfg = new_cfg;
+                        cfg_mtime = m; // commit only on a successful (non-empty) read
+                        if cfg.ban_list_file != ban_path {
+                            ban_path = cfg.ban_list_file.clone();
+                            banned = ban_path.as_deref().map(load_banlist).unwrap_or_default();
+                            ban_mtime = ban_path.as_deref().and_then(mtime);
+                        }
+                        eprintln!("strfry-ratelimit: reloaded config from {p}");
+                    }
+                    // read failed / empty (e.g. mid-write): keep last-good config and retry later.
+                }
+            }
+            if let Some(p) = &ban_path {
+                let m = mtime(p);
+                if m.is_some() && m != ban_mtime {
+                    banned = load_banlist(p);
+                    ban_mtime = m;
+                }
+            }
+        }
+
         let buf = &line[..];
         if buf.iter().all(|b| b.is_ascii_whitespace()) {
             continue;
