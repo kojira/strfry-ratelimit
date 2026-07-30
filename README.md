@@ -1,11 +1,16 @@
 # strfry-ratelimit
 
-A [strfry](https://github.com/hoytech/strfry) **writePolicy plugin** that rate-limits writes
-per pubkey and (optionally) auto-bans abusers — without patching strfry itself. It runs as a
+A [strfry](https://github.com/hoytech/strfry) **writePolicy plugin** that (1) drops events of
+configured kinds and (2) rate-limits writes per pubkey and (optionally) auto-bans abusers — without
+patching strfry itself. It runs as a
 separate process that strfry talks to over stdin/stdout, so it works with stock/upstream strfry.
 
 ## What it does
 
+- **Kind blocklist.** Events whose `kind` matches `RL_BLOCK_KINDS` (individual kinds and/or
+  inclusive ranges) are rejected outright, before rate limiting. This catches ephemeral floods
+  (e.g. relayed WebRTC signaling) that per-pubkey rate limiting can't stop because each event
+  uses a throwaway pubkey.
 - **Per-pubkey sliding-window rate limit.** Up to `RL_MAX_EVENTS` accepted per `RL_WINDOW_SECONDS`
   per pubkey. A longer window separates one-time bursts (fixed count) from sustained spam (which
   scales with the window), so a generous window tolerates legit bursts while still catching floods.
@@ -41,6 +46,7 @@ relay {
 
 | Variable               | Default | Meaning |
 |------------------------|---------|---------|
+| `RL_BLOCK_KINDS`        | (none)  | Kinds dropped outright, before rate limiting. Comma-separated singles and/or `lo-hi` ranges, e.g. `20001,22000-22999` |
 | `RL_WINDOW_SECONDS`    | `60`    | Sliding window length (seconds) |
 | `RL_MAX_EVENTS`        | `10`    | Max accepted events per window per pubkey |
 | `RL_MODE`              | `reject`| `reject` (OK false) or `shadow` (OK true but dropped) |
@@ -67,6 +73,9 @@ RL_BAN_LIST_FILE=./strfry-db/banned-pubkeys.txt
   (`sourceInfo`), but banning IPs causes heavy collateral damage when legitimate aggregator relays
   or apps forward many users from one address. Pubkey-level limiting is the safer default.
 - State is in memory; only bans persist (to `RL_BAN_LIST_FILE`).
+- Parsing is dependency-free: the request line is byte-scanned for just `type`/`id`/`pubkey`/`kind`
+  (a `"kind":` etc. inside a string value is escaped, so it never false-matches). No serde, no
+  allocation per event.
 
 ## License
 

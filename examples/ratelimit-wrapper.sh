@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # strfry writePolicy plugin wrapper: sets config via env, then execs the binary.
 # Point relay.writePolicy.plugin at this script.
+# Drop these kinds outright (singles and/or lo-hi ranges), before rate limiting:
+export RL_BLOCK_KINDS="20001,22000-22999"
 export RL_WINDOW_SECONDS=180
 export RL_MAX_EVENTS=100
 export RL_MODE=reject
