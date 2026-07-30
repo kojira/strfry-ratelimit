@@ -61,11 +61,14 @@ fn parse_kind_list(spec: &str) -> (Vec<u64>, Vec<(u64, u64)>) {
             continue;
         }
         if let Some((a, b)) = p.split_once('-') {
-            if let (Ok(a), Ok(b)) = (a.trim().parse::<u64>(), b.trim().parse::<u64>()) {
-                ranges.push((a.min(b), a.max(b)));
+            match (a.trim().parse::<u64>(), b.trim().parse::<u64>()) {
+                (Ok(a), Ok(b)) => ranges.push((a.min(b), a.max(b))),
+                _ => eprintln!("strfry-ratelimit: ignoring unparseable RL_BLOCK_KINDS range {p:?}"),
             }
         } else if let Ok(k) = p.parse::<u64>() {
             singles.push(k);
+        } else {
+            eprintln!("strfry-ratelimit: ignoring unparseable RL_BLOCK_KINDS token {p:?}");
         }
     }
     (singles, ranges)
@@ -158,6 +161,9 @@ fn load_banlist(path: &str) -> HashSet<String> {
     if let Ok(content) = std::fs::read_to_string(path) {
         for line in content.lines() {
             let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue; // comments / blank lines
+            }
             if line.len() == 64 && line.bytes().all(|b| b.is_ascii_hexdigit()) {
                 set.insert(line.to_ascii_lowercase());
             }
@@ -226,34 +232,39 @@ fn main() {
             }
         }
 
-        let kind = match scan_u64(buf, b"\"kind\":") {
-            Some(k) => k,
-            None => {
-                respond(&mut out, id, "accept", ""); // can't read kind: fail open
+        let kind = scan_u64(buf, b"\"kind\":");
+
+        // 1) Kind blocklist — cheap, drops floods outright before we extract pubkey or touch state.
+        if let Some(k) = kind {
+            if cfg.is_blocked(k) {
+                respond(&mut out, id, "reject", "blocked: kind not accepted here");
                 continue;
             }
-        };
-
-        // 1) Kind blocklist — dropped outright, before rate limiting.
-        if cfg.is_blocked(kind) {
-            respond(&mut out, id, "reject", "blocked: kind not accepted here");
-            continue;
         }
 
-        // pubkey should be 64 hex; if unreadable, fail open rather than mis-key rate-limit state.
+        // pubkey should be 64 hex; None if unreadable (then it can't be banned or rate-limited).
         let pubkey = match std::str::from_utf8(scan_str(buf, b"\"pubkey\":")) {
-            Ok(s) if !s.is_empty() => s.to_ascii_lowercase(),
+            Ok(s) if !s.is_empty() => Some(s.to_ascii_lowercase()),
+            _ => None,
+        };
+
+        // 2) Banlist — checked before any fail-open accept, so a ban can't be bypassed by a
+        //    malformed kind/pubkey field.
+        if let Some(pk) = &pubkey {
+            if !banned.is_empty() && banned.contains(pk) {
+                respond(&mut out, id, "reject", "blocked: pubkey is banned");
+                continue;
+            }
+        }
+
+        // Rate limiting needs a readable kind and pubkey; otherwise accept (fail open).
+        let (kind, pubkey) = match (kind, pubkey) {
+            (Some(k), Some(pk)) => (k, pk),
             _ => {
                 respond(&mut out, id, "accept", "");
                 continue;
             }
         };
-
-        // 2) Banlist.
-        if !banned.is_empty() && banned.contains(&pubkey) {
-            respond(&mut out, id, "reject", "blocked: pubkey is banned");
-            continue;
-        }
 
         // 3) Is this kind subject to rate limiting?
         let subject = !cfg.exclude_kinds.contains(&kind)
