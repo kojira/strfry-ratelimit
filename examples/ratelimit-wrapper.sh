@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # strfry writePolicy plugin wrapper: sets config via env, then execs the binary.
 # Point relay.writePolicy.plugin at this script.
+#
+# Alternatively, use a hot-reloadable config file instead of the env vars below:
+#   export RL_CONFIG_FILE="$(dirname "$0")/strfry-ratelimit.conf"
 # Drop these kinds outright (singles and/or lo-hi ranges), before rate limiting:
 export RL_BLOCK_KINDS="20001,22000-22999"
 export RL_WINDOW_SECONDS=180

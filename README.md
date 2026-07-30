@@ -46,6 +46,7 @@ relay {
 
 | Variable               | Default | Meaning |
 |------------------------|---------|---------|
+| `RL_CONFIG_FILE`       | (none)  | Load settings from this file instead of env vars; hot-reloaded on change (see below) |
 | `RL_BLOCK_KINDS`        | (none)  | Kinds dropped outright, before rate limiting. Comma-separated singles and/or `lo-hi` ranges, e.g. `20001,22000-22999` |
 | `RL_WINDOW_SECONDS`    | `60`    | Sliding window length (seconds) |
 | `RL_MAX_EVENTS`        | `10`    | Max accepted events per window per pubkey |
@@ -63,6 +64,21 @@ Example tuned for a busy relay (≈100 spam events/min must be caught, legit bur
 RL_WINDOW_SECONDS=180 RL_MAX_EVENTS=100 RL_BAN_ON_EXCEED=true \
 RL_BAN_LIST_FILE=./strfry-db/banned-pubkeys.txt
 ```
+
+## Config file & hot-reload
+
+Set `RL_CONFIG_FILE=/path/to/strfry-ratelimit.conf` to load settings from a file instead of
+environment variables. The file is `key = value` (`#` starts a comment); keys are the env names
+**without** the `RL_` prefix, lowercased — e.g. `window_seconds`, `max_events`, `block_kinds`,
+`ban_list_file`. See [`examples/strfry-ratelimit.conf`](examples/strfry-ratelimit.conf).
+
+The plugin **re-reads the config file and the banlist when they change (by mtime)**, so you can
+adjust `block_kinds`, rate limits, exemptions, and bans/unbans **without restarting strfry**.
+In-memory rate-limit state is preserved across reloads. (A change is detected within a few dozen
+processed events — effectively immediate on a busy relay.)
+
+If `RL_CONFIG_FILE` is unset, configuration comes from environment variables exactly as before
+(no hot-reload).
 
 ## Notes
 
