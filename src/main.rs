@@ -50,18 +50,19 @@ struct Config {
 /// `burst`; each ephemeral event costs one token. Empty bucket => shed the event.
 struct TokenBucket {
     tokens: f64,
-    last: f64,
+    /// Monotonic, so an NTP step or suspend/resume can neither freeze the bucket nor grant a
+    /// free refill (which a wall clock would).
+    last: std::time::Instant,
 }
 
 impl TokenBucket {
     fn new(burst: f64) -> Self {
-        TokenBucket { tokens: burst, last: now_millis() }
+        TokenBucket { tokens: burst, last: std::time::Instant::now() }
     }
     /// Try to spend one token, refilling first. Returns false when the budget is exhausted.
     fn allow(&mut self, rate: f64, burst: f64) -> bool {
-        let now = now_millis();
-        // Guard against a non-monotonic clock: never refill on a backwards jump.
-        let elapsed = ((now - self.last) / 1000.0).max(0.0);
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(self.last).as_secs_f64();
         self.last = now;
         self.tokens = (self.tokens + elapsed * rate).min(burst);
         if self.tokens >= 1.0 {
@@ -127,6 +128,31 @@ impl Config {
                 .map(|v| v.split(',').filter_map(|s| s.trim().parse().ok()).collect())
                 .unwrap_or_else(|| d.iter().copied().collect())
         };
+        // Non-negative finite float, warning (rather than silently disabling the defence) when a
+        // value is present but unusable — a typo like `5/s` must not read as "ceiling off".
+        let f64_of = |k: &str| -> f64 {
+            match get(k) {
+                None => 0.0,
+                Some(v) => match v.trim().parse::<f64>() {
+                    Ok(f) if f.is_finite() && f >= 0.0 => f,
+                    _ => {
+                        eprintln!("strfry-ratelimit: ignoring invalid {k} value {:?} (want a non-negative number)", v.trim());
+                        0.0
+                    }
+                },
+            }
+        };
+        let rate = f64_of("ephemeral_rate_per_sec");
+        // A ceiling with burst < 1 can never issue a token, which would silently shed 100% of
+        // ephemeral traffic. Raise it to a usable depth rather than blackholing the relay.
+        let mut burst = f64_of("ephemeral_burst");
+        if rate > 0.0 && burst < 1.0 {
+            let fixed = rate.max(1.0);
+            eprintln!(
+                "strfry-ratelimit: ephemeral_burst {burst} is too small to ever allow an event; using {fixed}. Set ephemeral_burst explicitly (>= 1)."
+            );
+            burst = fixed;
+        }
         let (block_singles, block_ranges) = parse_kind_list(&get("block_kinds").unwrap_or_default());
         Config {
             window_seconds: u64_of("window_seconds", 60),
@@ -140,12 +166,8 @@ impl Config {
             exempt_addressable: bool_of("exempt_addressable", false),
             block_singles,
             block_ranges,
-            ephemeral_rate_per_sec: get("ephemeral_rate_per_sec")
-                .and_then(|v| v.trim().parse().ok())
-                .unwrap_or(0.0),
-            ephemeral_burst: get("ephemeral_burst")
-                .and_then(|v| v.trim().parse().ok())
-                .unwrap_or(0.0),
+            ephemeral_rate_per_sec: rate,
+            ephemeral_burst: burst,
         }
     }
     /// Config from environment variables: generic key `foo_bar` reads env `RL_FOO_BAR`.
@@ -190,11 +212,6 @@ fn is_addressable(kind: u64) -> bool {
 }
 fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
-}
-
-/// Wall-clock milliseconds as f64, for sub-second token-bucket refills.
-fn now_millis() -> f64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64() * 1000.0).unwrap_or(0.0)
 }
 
 /// First index of `needle` in `hay`, or None.
@@ -303,6 +320,8 @@ fn main() {
     // burst is picked up by allow()'s clamp on the next event.
     let mut eph_bucket = TokenBucket::new(cfg.ephemeral_burst);
     let mut eph_shed: u64 = 0;
+    let mut eph_shed_logged: u64 = 0;
+    let mut eph_log_last: Option<std::time::Instant> = None;
 
     eprintln!(
         "strfry-ratelimit: source={} window={}s max={} banOnExceed={} blockSingles={:?} blockRanges={:?} excludeKinds={:?} exempt(eph={},repl={},addr={}) ephemeralCeiling={} banned_loaded={}",
@@ -350,7 +369,14 @@ fn main() {
                             banned = ban_path.as_deref().map(load_banlist).unwrap_or_default();
                             ban_mtime = ban_path.as_deref().and_then(mtime);
                         }
-                        eprintln!("strfry-ratelimit: reloaded config from {p}");
+                        eprintln!(
+                            "strfry-ratelimit: reloaded config from {p} (ephemeralCeiling={})",
+                            if cfg.ephemeral_rate_per_sec > 0.0 {
+                                format!("{}/s burst {}", cfg.ephemeral_rate_per_sec, cfg.ephemeral_burst)
+                            } else {
+                                "off".to_string()
+                            }
+                        );
                     }
                     // read failed / empty (e.g. mid-write): keep last-good config and retry later.
                 }
@@ -390,31 +416,6 @@ fn main() {
             }
         }
 
-        // 1b) Relay-wide ephemeral ceiling. Deliberately BEFORE pubkey extraction and the
-        //     per-pubkey limit: a distributed flood spreads itself thin across many pubkeys, so
-        //     only a global budget can see it. Kind-agnostic, so switching ephemeral kinds does
-        //     not evade it.
-        if cfg.ephemeral_rate_per_sec > 0.0 {
-            if let Some(k) = kind {
-                if is_ephemeral(k) && !eph_bucket.allow(cfg.ephemeral_rate_per_sec, cfg.ephemeral_burst) {
-                    eph_shed = eph_shed.wrapping_add(1);
-                    // Log once per 1000 shed events so a sustained flood is visible without
-                    // reproducing the log-spam that the flood itself causes.
-                    if eph_shed % 1000 == 1 {
-                        eprintln!(
-                            "strfry-ratelimit: ephemeral ceiling active ({}/s burst {}), shed {} events so far (latest kind {})",
-                            cfg.ephemeral_rate_per_sec, cfg.ephemeral_burst, eph_shed, k
-                        );
-                    }
-                    // shadowReject: the sender is told OK, but nothing is stored or broadcast.
-                    // A flood source gets no signal to switch tactics, and a legitimate client
-                    // caught in the overflow is not shown a confusing error.
-                    respond(&mut out, id, "shadowReject", "");
-                    continue;
-                }
-            }
-        }
-
         // pubkey should be 64 hex; None if unreadable (then it can't be banned or rate-limited).
         let pubkey = match std::str::from_utf8(scan_str(buf, b"\"pubkey\":")) {
             Ok(s) if !s.is_empty() => Some(s.to_ascii_lowercase()),
@@ -430,11 +431,49 @@ fn main() {
             }
         }
 
+        // 2b) Relay-wide ephemeral ceiling. Runs AFTER the banlist so an already-banned pubkey
+        //     cannot drain the shared budget, but BEFORE the per-pubkey limit, because a
+        //     distributed flood spreads itself thin across many pubkeys and only a global budget
+        //     can see it. Kind-agnostic, so switching ephemeral kinds does not evade it.
+        //     A shed event still falls through to the per-pubkey window below (it is only
+        //     answered early), so `ban_on_exceed` still catches a single-source flood.
+        let mut shed = false;
+        if cfg.ephemeral_rate_per_sec > 0.0 {
+            if let Some(k) = kind {
+                if is_ephemeral(k) && !eph_bucket.allow(cfg.ephemeral_rate_per_sec, cfg.ephemeral_burst) {
+                    shed = true;
+                    eph_shed = eph_shed.wrapping_add(1);
+                    // Throttle by TIME, not count: a sustained flood must not spam the log, but a
+                    // later small episode must still be reported (a count-based phase would skip
+                    // it entirely).
+                    let now_i = std::time::Instant::now();
+                    let since = eph_log_last.map(|t| now_i.duration_since(t).as_secs_f64());
+                    if since.is_none_or(|s| s >= 10.0) {
+                        match since {
+                            // First shed of an episode: no window to report yet.
+                            None => eprintln!(
+                                "strfry-ratelimit: ephemeral ceiling ({}/s burst {}) engaged, shedding events (latest kind {})",
+                                cfg.ephemeral_rate_per_sec, cfg.ephemeral_burst, k
+                            ),
+                            Some(s) => eprintln!(
+                                "strfry-ratelimit: ephemeral ceiling ({}/s burst {}) shed {} events in the last {s:.0}s (total {}, latest kind {})",
+                                cfg.ephemeral_rate_per_sec, cfg.ephemeral_burst,
+                                eph_shed - eph_shed_logged, eph_shed, k
+                            ),
+                        }
+                        eph_log_last = Some(now_i);
+                        eph_shed_logged = eph_shed;
+                    }
+                }
+            }
+        }
+
         // Rate limiting needs a readable kind and pubkey; otherwise accept (fail open).
         let (kind, pubkey) = match (kind, pubkey) {
             (Some(k), Some(pk)) => (k, pk),
             _ => {
-                respond(&mut out, id, "accept", "");
+                // Nothing to rate-limit against, but a shed event must still not be stored.
+                respond(&mut out, id, if shed { "shadowReject" } else { "accept" }, "");
                 continue;
             }
         };
@@ -445,7 +484,9 @@ fn main() {
             && !(cfg.exempt_replaceable && is_replaceable(kind))
             && !(cfg.exempt_addressable && is_addressable(kind));
         if !subject {
-            respond(&mut out, id, "accept", "");
+            // Exempt from the per-pubkey limiter, but the ceiling still applies: an exempt
+            // ephemeral kind is exactly what a flood uses.
+            respond(&mut out, id, if shed { "shadowReject" } else { "accept" }, "");
             continue;
         }
 
@@ -478,7 +519,8 @@ fn main() {
         }
 
         bucket.push_back(now);
-        respond(&mut out, id, "accept", "");
+        // Counted against the pubkey either way; shed events are simply not stored.
+        respond(&mut out, id, if shed { "shadowReject" } else { "accept" }, "");
 
         // Periodically evict expired/empty buckets to bound memory.
         processed = processed.wrapping_add(1);
@@ -494,5 +536,73 @@ fn main() {
                 !b.is_empty()
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg_with(rate: &str, burst: &str) -> Config {
+        let map: HashMap<&str, &str> =
+            [("ephemeral_rate_per_sec", rate), ("ephemeral_burst", burst)].into_iter().collect();
+        Config::from_lookup(|k| map.get(k).map(|s| s.to_string()))
+    }
+
+    /// A ceiling whose burst can never reach 1 token would silently shed 100% of ephemeral
+    /// traffic; config load must raise it to a usable depth instead.
+    #[test]
+    fn burst_too_small_is_raised_not_blackholed() {
+        for b in ["0", "0.5", "-5"] {
+            let c = cfg_with("5", b);
+            assert!(c.ephemeral_burst >= 1.0, "burst {b} left unusable: {}", c.ephemeral_burst);
+            let mut tb = TokenBucket::new(c.ephemeral_burst);
+            assert!(
+                tb.allow(c.ephemeral_rate_per_sec, c.ephemeral_burst),
+                "ceiling with burst {b} never allows an event"
+            );
+        }
+    }
+
+    /// Unusable values must not silently read as "ceiling off" (a typo would disable the defence).
+    #[test]
+    fn invalid_values_are_rejected_to_zero() {
+        for bad in ["5/s", "five", "nan", "inf", "-1"] {
+            assert_eq!(cfg_with(bad, "30").ephemeral_rate_per_sec, 0.0, "rate {bad}");
+        }
+        // NaN/inf burst must not survive into the bucket clamp.
+        for bad in ["nan", "inf"] {
+            let c = cfg_with("5", bad);
+            assert!(c.ephemeral_burst.is_finite(), "burst {bad} stayed non-finite");
+        }
+    }
+
+    #[test]
+    fn ceiling_is_off_by_default() {
+        let c = Config::from_lookup(|_| None);
+        assert_eq!(c.ephemeral_rate_per_sec, 0.0);
+    }
+
+    /// Burst is spent first, then the sustained rate refills it; the cap is never exceeded.
+    #[test]
+    fn bucket_drains_then_refills_at_rate() {
+        let (rate, burst) = (5.0, 10.0);
+        let mut tb = TokenBucket::new(burst);
+        let allowed = (0..50).filter(|_| tb.allow(rate, burst)).count();
+        assert_eq!(allowed, 10, "burst should be exactly {burst}");
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        let after = (0..50).filter(|_| tb.allow(rate, burst)).count();
+        assert!((2..=4).contains(&after), "0.6s at 5/s should refill ~3, got {after}");
+    }
+
+    /// Refills are capped at `burst`, so a long idle period cannot bank an unbounded burst.
+    #[test]
+    fn idle_does_not_bank_more_than_burst() {
+        let (rate, burst) = (100.0, 3.0);
+        let mut tb = TokenBucket::new(burst);
+        while tb.allow(rate, burst) {}
+        std::thread::sleep(std::time::Duration::from_millis(200)); // would earn 20 tokens uncapped
+        let after = (0..50).filter(|_| tb.allow(rate, burst)).count();
+        assert!(after <= 3, "idle banked {after} tokens, cap is {burst}");
     }
 }

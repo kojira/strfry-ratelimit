@@ -19,6 +19,10 @@ separate process that strfry talks to over stdin/stdout, so it works with stock/
   - **Replaceable** (0, 3, 41, 10000–19999): only the latest per (pubkey,kind) is stored → exempt.
   - **Regular** + **Addressable** (30000–39999): can accumulate → limited.
   - Plus an explicit `RL_EXCLUDE_KINDS` list (default `7` = reactions).
+- **Relay-wide ephemeral ceiling.** An optional global token-bucket cap on ephemeral events
+  (`RL_EPHEMERAL_RATE_PER_SEC`), for *distributed* floods that spread across many pubkeys so no
+  per-sender limit can see them. Kind-agnostic, so it survives an attacker switching kinds.
+  Off by default — [see below](#relay-wide-ephemeral-ceiling-distributed-flood-defence).
 - **Optional auto-ban.** When `RL_BAN_ON_EXCEED=true`, a pubkey that exceeds the limit is banned
   (all its events rejected) and persisted to `RL_BAN_LIST_FILE`. Remove the line and restart to unban.
 
@@ -60,6 +64,13 @@ relay {
 | `RL_EPHEMERAL_RATE_PER_SEC` | `0` (off) | Relay-wide ceiling on ephemeral events (20000–29999), events/second. See below |
 | `RL_EPHEMERAL_BURST`   | `0`     | Bucket depth for the ceiling — instantaneous burst allowed before the sustained rate applies |
 
+Example tuned for a busy relay (≈100 spam events/min must be caught, legit bursts ≈30 must pass):
+
+```sh
+RL_WINDOW_SECONDS=180 RL_MAX_EVENTS=100 RL_BAN_ON_EXCEED=true \
+RL_BAN_LIST_FILE=./strfry-db/banned-pubkeys.txt
+```
+
 ### Relay-wide ephemeral ceiling (distributed-flood defence)
 
 Per-pubkey limits cannot see a **distributed** flood: hundreds of pubkeys each
@@ -68,11 +79,29 @@ the limit. `RL_EPHEMERAL_RATE_PER_SEC` adds a single global token-bucket budget
 for ephemeral kinds, which catches exactly that shape.
 
 It is **kind-agnostic**, so unlike `RL_BLOCK_KINDS` it does not need to know
-which kind is being abused, cannot be evaded by switching kinds, and does not
-collateral-block a whole kind range (a legitimate user of kind 22xxx still gets
-through — only the excess volume is shed). Over-limit events get
-`shadowReject` (the sender sees OK, nothing is stored or broadcast), so a flood
-source gets no signal to change tactics.
+which kind is being abused and cannot be evaded by switching to another
+ephemeral kind. (An attacker who leaves the ephemeral range entirely — e.g.
+kind 1 — exits this ceiling and falls back on the per-pubkey limiter.)
+Over-limit events get `shadowReject` (the sender sees OK, nothing is stored or
+broadcast), so a flood source gets no signal to change tactics.
+
+**What it does and does not protect.** This is a single first-come-first-served
+budget with no per-sender fairness: during a flood, tokens are won roughly in
+proportion to share of traffic, so a legitimate client sending 0.5% of the
+ephemeral volume gets ~0.5% of the budget. It caps total relay load — the relay
+stays up and non-ephemeral traffic (posts, reactions, DMs) is untouched — but it
+does **not** keep ephemeral traffic working for legitimate users while a flood
+is in progress; it degrades everyone's ephemeral traffic by volume share. Choose
+it over `RL_BLOCK_KINDS` because it survives kind-switching and needs no
+per-incident tuning, not because it shields individual users mid-flood.
+
+Shed events still count against the per-pubkey window, so `RL_BAN_ON_EXCEED`
+continues to catch a single-source flood, and already-banned pubkeys are
+rejected before they can consume the budget.
+
+Scope: the budget is per plugin process. `strfry relay` runs one writer thread
+and so one plugin instance, but `strfry router`/`stream`/`sync` each spawn their
+own instance with an independent bucket.
 
 Size it from your relay's actual ephemeral baseline, not a guess — measure
 first, then allow roughly an order of magnitude of headroom. A relay measured at
@@ -83,13 +112,6 @@ RL_EPHEMERAL_RATE_PER_SEC=5 RL_EPHEMERAL_BURST=30
 ```
 
 Disabled by default (`0`), so existing deployments are unaffected.
-
-Example tuned for a busy relay (≈100 spam events/min must be caught, legit bursts ≈30 must pass):
-
-```sh
-RL_WINDOW_SECONDS=180 RL_MAX_EVENTS=100 RL_BAN_ON_EXCEED=true \
-RL_BAN_LIST_FILE=./strfry-db/banned-pubkeys.txt
-```
 
 ## Config file & hot-reload
 
