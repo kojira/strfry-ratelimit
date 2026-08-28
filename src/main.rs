@@ -35,6 +35,42 @@ struct Config {
     exempt_addressable: bool,
     block_singles: Vec<u64>,
     block_ranges: Vec<(u64, u64)>,
+    /// Relay-wide ceiling on ephemeral events (kinds 20000-29999), in events per second.
+    /// 0 disables it. Unlike the per-pubkey limit this is a single global budget, which is what
+    /// catches a *distributed* flood: hundreds of pubkeys/IPs each sending a modest rate sum to a
+    /// firehose that no per-sender limit can see. It is also kind-agnostic, so an attacker that
+    /// switches to a different ephemeral kind is still capped.
+    ephemeral_rate_per_sec: f64,
+    /// Bucket depth for the above — how big an instantaneous burst is allowed through before the
+    /// sustained rate applies (e.g. several clients starting a call at once).
+    ephemeral_burst: f64,
+}
+
+/// Token bucket for the relay-wide ephemeral ceiling. Refills at `rate` tokens/sec up to
+/// `burst`; each ephemeral event costs one token. Empty bucket => shed the event.
+struct TokenBucket {
+    tokens: f64,
+    last: f64,
+}
+
+impl TokenBucket {
+    fn new(burst: f64) -> Self {
+        TokenBucket { tokens: burst, last: now_millis() }
+    }
+    /// Try to spend one token, refilling first. Returns false when the budget is exhausted.
+    fn allow(&mut self, rate: f64, burst: f64) -> bool {
+        let now = now_millis();
+        // Guard against a non-monotonic clock: never refill on a backwards jump.
+        let elapsed = ((now - self.last) / 1000.0).max(0.0);
+        self.last = now;
+        self.tokens = (self.tokens + elapsed * rate).min(burst);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// File modification time, or None if the path is unset/unreadable. Used to detect edits to the
@@ -104,6 +140,12 @@ impl Config {
             exempt_addressable: bool_of("exempt_addressable", false),
             block_singles,
             block_ranges,
+            ephemeral_rate_per_sec: get("ephemeral_rate_per_sec")
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0.0),
+            ephemeral_burst: get("ephemeral_burst")
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0.0),
         }
     }
     /// Config from environment variables: generic key `foo_bar` reads env `RL_FOO_BAR`.
@@ -148,6 +190,11 @@ fn is_addressable(kind: u64) -> bool {
 }
 fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Wall-clock milliseconds as f64, for sub-second token-bucket refills.
+fn now_millis() -> f64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64() * 1000.0).unwrap_or(0.0)
 }
 
 /// First index of `needle` in `hay`, or None.
@@ -252,12 +299,22 @@ fn main() {
     let mut ban_mtime = ban_path.as_deref().and_then(mtime);
 
     let mut buckets: HashMap<String, VecDeque<u64>> = HashMap::new();
+    // Relay-wide ephemeral budget. Sized from the current config; a hot-reload that raises the
+    // burst is picked up by allow()'s clamp on the next event.
+    let mut eph_bucket = TokenBucket::new(cfg.ephemeral_burst);
+    let mut eph_shed: u64 = 0;
 
     eprintln!(
-        "strfry-ratelimit: source={} window={}s max={} banOnExceed={} blockSingles={:?} blockRanges={:?} excludeKinds={:?} exempt(eph={},repl={},addr={}) banned_loaded={}",
+        "strfry-ratelimit: source={} window={}s max={} banOnExceed={} blockSingles={:?} blockRanges={:?} excludeKinds={:?} exempt(eph={},repl={},addr={}) ephemeralCeiling={} banned_loaded={}",
         cfg_path.as_deref().unwrap_or("env"), cfg.window_seconds, cfg.max_events, cfg.ban_on_exceed,
         cfg.block_singles, cfg.block_ranges, cfg.exclude_kinds, cfg.exempt_ephemeral,
-        cfg.exempt_replaceable, cfg.exempt_addressable, banned.len()
+        cfg.exempt_replaceable, cfg.exempt_addressable,
+        if cfg.ephemeral_rate_per_sec > 0.0 {
+            format!("{}/s burst {}", cfg.ephemeral_rate_per_sec, cfg.ephemeral_burst)
+        } else {
+            "off".to_string()
+        },
+        banned.len()
     );
 
     let stdin = io::stdin();
@@ -330,6 +387,31 @@ fn main() {
             if cfg.is_blocked(k) {
                 respond(&mut out, id, "reject", "blocked: kind not accepted here");
                 continue;
+            }
+        }
+
+        // 1b) Relay-wide ephemeral ceiling. Deliberately BEFORE pubkey extraction and the
+        //     per-pubkey limit: a distributed flood spreads itself thin across many pubkeys, so
+        //     only a global budget can see it. Kind-agnostic, so switching ephemeral kinds does
+        //     not evade it.
+        if cfg.ephemeral_rate_per_sec > 0.0 {
+            if let Some(k) = kind {
+                if is_ephemeral(k) && !eph_bucket.allow(cfg.ephemeral_rate_per_sec, cfg.ephemeral_burst) {
+                    eph_shed = eph_shed.wrapping_add(1);
+                    // Log once per 1000 shed events so a sustained flood is visible without
+                    // reproducing the log-spam that the flood itself causes.
+                    if eph_shed % 1000 == 1 {
+                        eprintln!(
+                            "strfry-ratelimit: ephemeral ceiling active ({}/s burst {}), shed {} events so far (latest kind {})",
+                            cfg.ephemeral_rate_per_sec, cfg.ephemeral_burst, eph_shed, k
+                        );
+                    }
+                    // shadowReject: the sender is told OK, but nothing is stored or broadcast.
+                    // A flood source gets no signal to switch tactics, and a legitimate client
+                    // caught in the overflow is not shown a confusing error.
+                    respond(&mut out, id, "shadowReject", "");
+                    continue;
+                }
             }
         }
 

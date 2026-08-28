@@ -57,6 +57,32 @@ relay {
 | `RL_EXEMPT_EPHEMERAL`  | `true`  | Exempt ephemeral kinds (20000–29999) |
 | `RL_EXEMPT_REPLACEABLE`| `true`  | Exempt replaceable kinds (0,3,41,10000–19999) |
 | `RL_EXEMPT_ADDRESSABLE`| `false` | Exempt addressable kinds (30000–39999) |
+| `RL_EPHEMERAL_RATE_PER_SEC` | `0` (off) | Relay-wide ceiling on ephemeral events (20000–29999), events/second. See below |
+| `RL_EPHEMERAL_BURST`   | `0`     | Bucket depth for the ceiling — instantaneous burst allowed before the sustained rate applies |
+
+### Relay-wide ephemeral ceiling (distributed-flood defence)
+
+Per-pubkey limits cannot see a **distributed** flood: hundreds of pubkeys each
+sending a modest rate sum to a firehose while every individual sender stays under
+the limit. `RL_EPHEMERAL_RATE_PER_SEC` adds a single global token-bucket budget
+for ephemeral kinds, which catches exactly that shape.
+
+It is **kind-agnostic**, so unlike `RL_BLOCK_KINDS` it does not need to know
+which kind is being abused, cannot be evaded by switching kinds, and does not
+collateral-block a whole kind range (a legitimate user of kind 22xxx still gets
+through — only the excess volume is shed). Over-limit events get
+`shadowReject` (the sender sees OK, nothing is stored or broadcast), so a flood
+source gets no signal to change tactics.
+
+Size it from your relay's actual ephemeral baseline, not a guess — measure
+first, then allow roughly an order of magnitude of headroom. A relay measured at
+≈0.7 ephemeral events/sec:
+
+```sh
+RL_EPHEMERAL_RATE_PER_SEC=5 RL_EPHEMERAL_BURST=30
+```
+
+Disabled by default (`0`), so existing deployments are unaffected.
 
 Example tuned for a busy relay (≈100 spam events/min must be caught, legit bursts ≈30 must pass):
 
