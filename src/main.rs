@@ -128,8 +128,9 @@ impl Config {
                 .map(|v| v.split(',').filter_map(|s| s.trim().parse().ok()).collect())
                 .unwrap_or_else(|| d.iter().copied().collect())
         };
-        // Non-negative finite float, warning (rather than silently disabling the defence) when a
-        // value is present but unusable — a typo like `5/s` must not read as "ceiling off".
+        // Non-negative finite float. An unusable value (e.g. a typo like `5/s`) is warned about
+        // loudly and then treated as 0/absent — so check the log after editing: a bad
+        // `ephemeral_rate_per_sec` leaves the ceiling OFF, it does not fail closed.
         let f64_of = |k: &str| -> f64 {
             match get(k) {
                 None => 0.0,
@@ -435,8 +436,10 @@ fn main() {
         //     cannot drain the shared budget, but BEFORE the per-pubkey limit, because a
         //     distributed flood spreads itself thin across many pubkeys and only a global budget
         //     can see it. Kind-agnostic, so switching ephemeral kinds does not evade it.
-        //     A shed event still falls through to the per-pubkey window below (it is only
-        //     answered early), so `ban_on_exceed` still catches a single-source flood.
+        //     A shed event falls through to the per-pubkey window below rather than returning
+        //     here, so with `exempt_ephemeral = false` a single-source flood still trips
+        //     `ban_on_exceed`. Under the default `exempt_ephemeral = true` ephemeral kinds never
+        //     reach that window, so the ceiling caps the flood but nothing is banned for it.
         let mut shed = false;
         if cfg.ephemeral_rate_per_sec > 0.0 {
             if let Some(k) = kind {
@@ -448,7 +451,7 @@ fn main() {
                     // it entirely).
                     let now_i = std::time::Instant::now();
                     let since = eph_log_last.map(|t| now_i.duration_since(t).as_secs_f64());
-                    if since.is_none_or(|s| s >= 10.0) {
+                    if since.map_or(true, |s| s >= 10.0) {
                         match since {
                             // First shed of an episode: no window to report yet.
                             None => eprintln!(
@@ -458,7 +461,7 @@ fn main() {
                             Some(s) => eprintln!(
                                 "strfry-ratelimit: ephemeral ceiling ({}/s burst {}) shed {} events in the last {s:.0}s (total {}, latest kind {})",
                                 cfg.ephemeral_rate_per_sec, cfg.ephemeral_burst,
-                                eph_shed - eph_shed_logged, eph_shed, k
+                                eph_shed.wrapping_sub(eph_shed_logged), eph_shed, k
                             ),
                         }
                         eph_log_last = Some(now_i);
@@ -589,10 +592,17 @@ mod tests {
         let (rate, burst) = (5.0, 10.0);
         let mut tb = TokenBucket::new(burst);
         let allowed = (0..50).filter(|_| tb.allow(rate, burst)).count();
-        assert_eq!(allowed, 10, "burst should be exactly {burst}");
+        assert_eq!(allowed, 10, "burst should be exactly {burst}");  // no sleep involved: exact
+        let t0 = std::time::Instant::now();
         std::thread::sleep(std::time::Duration::from_millis(600));
         let after = (0..50).filter(|_| tb.allow(rate, burst)).count();
-        assert!((2..=4).contains(&after), "0.6s at 5/s should refill ~3, got {after}");
+        // Bound by what actually elapsed (sleep can overshoot on a loaded machine) rather than a
+        // fixed window, so this cannot flake.
+        let earned = t0.elapsed().as_secs_f64() * rate;
+        assert!(
+            after >= 2 && (after as f64) <= earned + 1.0,
+            "refilled {after} in {:.2}s at {rate}/s (earned {earned:.1})", t0.elapsed().as_secs_f64()
+        );
     }
 
     /// Refills are capped at `burst`, so a long idle period cannot bank an unbounded burst.

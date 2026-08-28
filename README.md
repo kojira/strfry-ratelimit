@@ -62,7 +62,7 @@ relay {
 | `RL_EXEMPT_REPLACEABLE`| `true`  | Exempt replaceable kinds (0,3,41,10000–19999) |
 | `RL_EXEMPT_ADDRESSABLE`| `false` | Exempt addressable kinds (30000–39999) |
 | `RL_EPHEMERAL_RATE_PER_SEC` | `0` (off) | Relay-wide ceiling on ephemeral events (20000–29999), events/second. See below |
-| `RL_EPHEMERAL_BURST`   | `0`     | Bucket depth for the ceiling — instantaneous burst allowed before the sustained rate applies |
+| `RL_EPHEMERAL_BURST`   | auto    | Bucket depth for the ceiling — instantaneous burst allowed before the sustained rate applies. Unset/too small becomes `max(rate, 1)` (with a warning) |
 
 Example tuned for a busy relay (≈100 spam events/min must be caught, legit bursts ≈30 must pass):
 
@@ -95,13 +95,21 @@ is in progress; it degrades everyone's ephemeral traffic by volume share. Choose
 it over `RL_BLOCK_KINDS` because it survives kind-switching and needs no
 per-incident tuning, not because it shields individual users mid-flood.
 
-Shed events still count against the per-pubkey window, so `RL_BAN_ON_EXCEED`
-continues to catch a single-source flood, and already-banned pubkeys are
-rejected before they can consume the budget.
+Already-banned pubkeys are rejected before they can consume the budget.
+
+Shed events still count against the per-pubkey window **only when
+`RL_EXEMPT_EPHEMERAL=false`**; with the default `true`, ephemeral kinds sit
+outside the per-pubkey limiter entirely, so `RL_BAN_ON_EXCEED` will **not** fire
+on an ephemeral flood — the ceiling caps it, but no one gets banned for it.
+If you do set `RL_EXEMPT_EPHEMERAL=false` alongside `RL_BAN_ON_EXCEED=true`, be
+aware of the flip side: during a flood a bystander's shed events still burn
+their own window, so a legitimate user can be auto-banned (across all kinds) for
+traffic the relay never stored.
 
 Scope: the budget is per plugin process. `strfry relay` runs one writer thread
-and so one plugin instance, but `strfry router`/`stream`/`sync` each spawn their
-own instance with an independent bucket.
+and so one plugin instance, but `strfry stream`/`sync` each spawn their own, and
+`strfry router` spawns **two per stream group** (up and down) — each with an
+independent bucket.
 
 Size it from your relay's actual ephemeral baseline, not a guess — measure
 first, then allow roughly an order of magnitude of headroom. A relay measured at
