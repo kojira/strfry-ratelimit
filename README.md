@@ -63,6 +63,8 @@ relay {
 | `RL_EXEMPT_ADDRESSABLE`| `false` | Exempt addressable kinds (30000–39999) |
 | `RL_EPHEMERAL_RATE_PER_SEC` | `0` (off) | Relay-wide ceiling on ephemeral events (20000–29999), events/second. See below |
 | `RL_EPHEMERAL_BURST`   | auto    | Bucket depth for the ceiling — instantaneous burst allowed before the sustained rate applies. Unset/too small becomes `max(rate, 1)` (with a warning) |
+| `RL_TOTAL_RATE_PER_SEC` | `0` (off) | Relay-wide ceiling across **all** kinds, events/second — the backstop for a flood that moves outside the ephemeral range |
+| `RL_TOTAL_BURST`       | auto    | Bucket depth for the all-kinds ceiling |
 
 Example tuned for a busy relay (≈100 spam events/min must be caught, legit bursts ≈30 must pass):
 
@@ -120,6 +122,27 @@ RL_EPHEMERAL_RATE_PER_SEC=5 RL_EPHEMERAL_BURST=30
 ```
 
 Disabled by default (`0`), so existing deployments are unaffected.
+
+### All-kinds ceiling (`RL_TOTAL_RATE_PER_SEC`)
+
+The ephemeral ceiling only covers 20000–29999. `RL_TOTAL_RATE_PER_SEC` is the
+same mechanism applied to **every** kind, as a backstop for an attacker who
+moves the same distributed flood to another range. An event that was already
+shed by the ephemeral ceiling is not charged to this budget, so a flood cannot
+consume it and starve normal traffic.
+
+Set it well above your real peak, because it applies to legitimate traffic too —
+including relay-to-relay sync bursts and backfills, which are far spikier than
+client writes. Measure your **non-ephemeral peak**, then leave a large margin:
+two relays measured here peaked at 4/s and 6/s non-ephemeral, so
+
+```sh
+RL_TOTAL_RATE_PER_SEC=50 RL_TOTAL_BURST=100
+```
+
+is ~8× the observed peak while still cutting a 4,000/s flood by 98%. This is a
+last-resort cap on total load, not a spam filter — leave the per-pubkey limiter
+to do the fine-grained work. Off by default.
 
 ## Config file & hot-reload
 

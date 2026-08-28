@@ -173,3 +173,51 @@ fn ceiling_off_by_default() {
     let (accepted, shed, _) = p.tally(300, PK_A, 22587);
     assert_eq!((accepted, shed), (300, 0), "ceiling was active without configuration");
 }
+
+/// The all-kinds ceiling catches a distributed flood that left the ephemeral range.
+#[test]
+fn total_ceiling_catches_flood_outside_ephemeral_range() {
+    let mut p = Plugin::start(&[
+        ("RL_TOTAL_RATE_PER_SEC", "5"),
+        ("RL_TOTAL_BURST", "10"),
+        ("RL_MAX_EVENTS", "1000000"), // isolate the ceiling from the per-pubkey limiter
+    ]);
+    let (mut accepted, mut shed) = (0, 0);
+    for i in 0..200 {
+        // kind 1: outside 20000-29999, so only the all-kinds ceiling can stop this.
+        match p.send(&format!("{i:064x}"), &format!("{i:064x}"), 1).as_str() {
+            "accept" => accepted += 1,
+            "shadowReject" => shed += 1,
+            other => panic!("unexpected {other}"),
+        }
+    }
+    assert!(shed > 150, "flood outside the ephemeral range was not capped: {shed} shed");
+    assert!(accepted <= 12, "let through more than the burst: {accepted}");
+}
+
+/// An event shed by the ephemeral ceiling must not also be charged to the all-kinds budget,
+/// or a flood would starve normal traffic of the shared backstop.
+#[test]
+fn ephemeral_shed_does_not_charge_total_budget() {
+    let mut p = Plugin::start(&[
+        ("RL_EPHEMERAL_RATE_PER_SEC", "1"),
+        ("RL_EPHEMERAL_BURST", "2"),
+        ("RL_TOTAL_RATE_PER_SEC", "1"),
+        ("RL_TOTAL_BURST", "20"),
+        ("RL_MAX_EVENTS", "1000000"),
+    ]);
+    // Drain the small ephemeral budget with a flood.
+    let (eph_ok, eph_shed, _) = p.tally(100, PK_A, 22587);
+    assert!(eph_ok <= 3 && eph_shed > 90, "ephemeral ceiling misbehaved: {eph_ok}/{eph_shed}");
+    // The all-kinds budget must be nearly intact for normal traffic.
+    let (ok, _, _) = p.tally(15, PK_B, 1);
+    assert!(ok >= 10, "flood drained the all-kinds budget: only {ok}/15 normal events accepted");
+}
+
+/// Both ceilings off by default.
+#[test]
+fn total_ceiling_off_by_default() {
+    let mut p = Plugin::start(&[("RL_MAX_EVENTS", "1000000")]);
+    let (accepted, shed, _) = p.tally(300, PK_A, 1);
+    assert_eq!((accepted, shed), (300, 0), "all-kinds ceiling was active without configuration");
+}
