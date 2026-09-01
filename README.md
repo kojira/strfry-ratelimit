@@ -19,6 +19,10 @@ separate process that strfry talks to over stdin/stdout, so it works with stock/
   - **Replaceable** (0, 3, 41, 10000–19999): only the latest per (pubkey,kind) is stored → exempt.
   - **Regular** + **Addressable** (30000–39999): can accumulate → limited.
   - Plus an explicit `RL_EXCLUDE_KINDS` list (default `7` = reactions).
+- **Relay-wide ephemeral ceiling.** An optional global token-bucket cap on ephemeral events
+  (`RL_EPHEMERAL_RATE_PER_SEC`), for *distributed* floods that spread across many pubkeys so no
+  per-sender limit can see them. Kind-agnostic, so it survives an attacker switching kinds.
+  Off by default — [see below](#relay-wide-ephemeral-ceiling-distributed-flood-defence).
 - **Optional auto-ban.** When `RL_BAN_ON_EXCEED=true`, a pubkey that exceeds the limit is banned
   (all its events rejected) and persisted to `RL_BAN_LIST_FILE`. Remove the line and restart to unban.
 
@@ -57,6 +61,11 @@ relay {
 | `RL_EXEMPT_EPHEMERAL`  | `true`  | Exempt ephemeral kinds (20000–29999) |
 | `RL_EXEMPT_REPLACEABLE`| `true`  | Exempt replaceable kinds (0,3,41,10000–19999) |
 | `RL_EXEMPT_ADDRESSABLE`| `false` | Exempt addressable kinds (30000–39999) |
+| `RL_EPHEMERAL_RATE_PER_SEC` | `0` (off) | Relay-wide ceiling on ephemeral events (20000–29999), events/second. See below |
+| `RL_EPHEMERAL_BURST`   | auto    | Bucket depth for the ceiling — instantaneous burst allowed before the sustained rate applies. Unset/too small becomes `max(rate, 1)` (with a warning) |
+| `RL_TOTAL_RATE_PER_SEC` | `0` (off) | Relay-wide ceiling across **all** kinds, events/second — the backstop for a flood that moves outside the ephemeral range |
+| `RL_TOTAL_BURST`       | auto    | Bucket depth for the all-kinds ceiling |
+| `RL_CEILING_MODE`      | `reject`| How a ceiling answers a shed event: `reject` (OK false, `rate-limited:` reason — lets cooperative clients back off) or `shadow` (OK true, silently dropped) |
 
 Example tuned for a busy relay (≈100 spam events/min must be caught, legit bursts ≈30 must pass):
 
@@ -64,6 +73,83 @@ Example tuned for a busy relay (≈100 spam events/min must be caught, legit bur
 RL_WINDOW_SECONDS=180 RL_MAX_EVENTS=100 RL_BAN_ON_EXCEED=true \
 RL_BAN_LIST_FILE=./strfry-db/banned-pubkeys.txt
 ```
+
+### Relay-wide ephemeral ceiling (distributed-flood defence)
+
+Per-pubkey limits cannot see a **distributed** flood: hundreds of pubkeys each
+sending a modest rate sum to a firehose while every individual sender stays under
+the limit. `RL_EPHEMERAL_RATE_PER_SEC` adds a single global token-bucket budget
+for ephemeral kinds, which catches exactly that shape.
+
+It is **kind-agnostic**, so unlike `RL_BLOCK_KINDS` it does not need to know
+which kind is being abused and cannot be evaded by switching to another
+ephemeral kind. (An attacker who leaves the ephemeral range entirely — e.g.
+kind 1 — exits this ceiling and falls back on the per-pubkey limiter.)
+Over-limit events are answered `["OK", id, false, "rate-limited: …"]` by
+default. The `rate-limited:` prefix matters: it is the same one strfry's built-in
+limiter uses, and cooperative clients key on it to back off (Trystero ≥ 0.25.4,
+for example, widens its announce interval up to 15 minutes on seeing it). That
+turns the ceiling from a wall into a signal, and a well-behaved source reduces
+its own load. Set `RL_CEILING_MODE=shadow` to answer `shadowReject` instead
+(sender sees OK, nothing is stored or broadcast) for a source you deliberately
+don't want to tip off.
+
+**What it does and does not protect.** This is a single first-come-first-served
+budget with no per-sender fairness: during a flood, tokens are won roughly in
+proportion to share of traffic, so a legitimate client sending 0.5% of the
+ephemeral volume gets ~0.5% of the budget. It caps total relay load — the relay
+stays up and non-ephemeral traffic (posts, reactions, DMs) is untouched — but it
+does **not** keep ephemeral traffic working for legitimate users while a flood
+is in progress; it degrades everyone's ephemeral traffic by volume share. Choose
+it over `RL_BLOCK_KINDS` because it survives kind-switching and needs no
+per-incident tuning, not because it shields individual users mid-flood.
+
+Already-banned pubkeys are rejected before they can consume the budget.
+
+Shed events still count against the per-pubkey window **only when
+`RL_EXEMPT_EPHEMERAL=false`**; with the default `true`, ephemeral kinds sit
+outside the per-pubkey limiter entirely, so `RL_BAN_ON_EXCEED` will **not** fire
+on an ephemeral flood — the ceiling caps it, but no one gets banned for it.
+If you do set `RL_EXEMPT_EPHEMERAL=false` alongside `RL_BAN_ON_EXCEED=true`, be
+aware of the flip side: during a flood a bystander's shed events still burn
+their own window, so a legitimate user can be auto-banned (across all kinds) for
+traffic the relay never stored.
+
+Scope: the budget is per plugin process. `strfry relay` runs one writer thread
+and so one plugin instance, but `strfry stream`/`sync` each spawn their own, and
+`strfry router` spawns **two per stream group** (up and down) — each with an
+independent bucket.
+
+Size it from your relay's actual ephemeral baseline, not a guess — measure
+first, then allow roughly an order of magnitude of headroom. A relay measured at
+≈0.7 ephemeral events/sec:
+
+```sh
+RL_EPHEMERAL_RATE_PER_SEC=5 RL_EPHEMERAL_BURST=30
+```
+
+Disabled by default (`0`), so existing deployments are unaffected.
+
+### All-kinds ceiling (`RL_TOTAL_RATE_PER_SEC`)
+
+The ephemeral ceiling only covers 20000–29999. `RL_TOTAL_RATE_PER_SEC` is the
+same mechanism applied to **every** kind, as a backstop for an attacker who
+moves the same distributed flood to another range. An event that was already
+shed by the ephemeral ceiling is not charged to this budget, so a flood cannot
+consume it and starve normal traffic.
+
+Set it well above your real peak, because it applies to legitimate traffic too —
+including relay-to-relay sync bursts and backfills, which are far spikier than
+client writes. Measure your **non-ephemeral peak**, then leave a large margin:
+two relays measured here peaked at 4/s and 6/s non-ephemeral, so
+
+```sh
+RL_TOTAL_RATE_PER_SEC=50 RL_TOTAL_BURST=100
+```
+
+is ~8× the observed peak while still cutting a 4,000/s flood by 98%. This is a
+last-resort cap on total load, not a spam filter — leave the per-pubkey limiter
+to do the fine-grained work. Off by default.
 
 ## Config file & hot-reload
 
