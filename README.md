@@ -94,6 +94,15 @@ its own load. Set `RL_CEILING_MODE=shadow` to answer `shadowReject` instead
 (sender sees OK, nothing is stored or broadcast) for a source you deliberately
 don't want to tip off.
 
+**Cost of `reject` you should know about:** strfry logs one INFO line per
+rejected event (`write policy blocked event …: <reason>`) whenever the plugin
+returns a non-empty reason, and nothing for `shadowReject`. Under a sustained
+flood that is hundreds of log lines per second — measured ~0.9 GB/day on one
+relay — and the logging itself cost ~10 percentage points of CPU. So choose
+`reject` when the clients hitting you can actually act on the signal, and
+`shadow` when they can't (e.g. the relay is no longer in any client's default
+list, so only old clients reach it). Either way, rotate the relay log.
+
 **What it does and does not protect.** This is a single first-come-first-served
 budget with no per-sender fairness: during a flood, tokens are won roughly in
 proportion to share of traffic, so a legitimate client sending 0.5% of the
