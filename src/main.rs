@@ -222,6 +222,17 @@ impl Config {
             );
             total_burst = fixed;
         }
+        // reject is the fail-safe: the event is still not stored, and the client still gets the
+        // back-off signal. Warn on a typo so an operator who meant `shadow` finds out.
+        let ceiling_shadow = match get("ceiling_mode").map(|m| m.trim().to_ascii_lowercase()) {
+            None => false,
+            Some(m) if m.is_empty() || m == "reject" => false,
+            Some(m) if m == "shadow" => true,
+            Some(m) => {
+                eprintln!("strfry-ratelimit: ignoring invalid ceiling_mode value {m:?} (want reject or shadow); using reject");
+                false
+            }
+        };
         let (block_singles, block_ranges) = parse_kind_list(&get("block_kinds").unwrap_or_default());
         Config {
             window_seconds: u64_of("window_seconds", 60),
@@ -239,9 +250,7 @@ impl Config {
             ephemeral_burst: burst,
             total_rate_per_sec: total_rate,
             total_burst,
-            ceiling_shadow: get("ceiling_mode")
-                .map(|m| m.trim().eq_ignore_ascii_case("shadow"))
-                .unwrap_or(false),
+            ceiling_shadow,
         }
     }
     /// Config from environment variables: generic key `foo_bar` reads env `RL_FOO_BAR`.
@@ -450,12 +459,18 @@ fn main() {
                             ban_mtime = ban_path.as_deref().and_then(mtime);
                         }
                         eprintln!(
-                            "strfry-ratelimit: reloaded config from {p} (ephemeralCeiling={})",
+                            "strfry-ratelimit: reloaded config from {p} (ephemeralCeiling={} totalCeiling={} ceilingMode={})",
                             if cfg.ephemeral_rate_per_sec > 0.0 {
                                 format!("{}/s burst {}", cfg.ephemeral_rate_per_sec, cfg.ephemeral_burst)
                             } else {
                                 "off".to_string()
-                            }
+                            },
+                            if cfg.total_rate_per_sec > 0.0 {
+                                format!("{}/s burst {}", cfg.total_rate_per_sec, cfg.total_burst)
+                            } else {
+                                "off".to_string()
+                            },
+                            if cfg.ceiling_shadow { "shadow" } else { "reject" }
                         );
                     }
                     // read failed / empty (e.g. mid-write): keep last-good config and retry later.

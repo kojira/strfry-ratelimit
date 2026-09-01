@@ -166,6 +166,20 @@ fn ceiling_reject_reason_lets_clients_back_off() {
     );
 }
 
+/// The all-kinds ceiling uses the same default verdict (guards a site-specific regression).
+#[test]
+fn total_ceiling_reject_reason_lets_clients_back_off() {
+    let mut p = Plugin::start(&[
+        ("RL_TOTAL_RATE_PER_SEC", "1"),
+        ("RL_TOTAL_BURST", "1"),
+        ("RL_MAX_EVENTS", "1000000"),
+    ]);
+    p.send_raw("00", PK_A, 1);
+    let line = p.send_raw("01", PK_A, 1);
+    assert!(line.contains("\"action\":\"reject\""), "expected reject, got {line}");
+    assert!(line.contains("\"msg\":\"rate-limited:"), "missing rate-limited: prefix: {line}");
+}
+
 /// `ceiling_mode = shadow` keeps the old silent behaviour for sources you don't want to tip off.
 #[test]
 fn ceiling_shadow_mode_answers_shadow_reject() {
