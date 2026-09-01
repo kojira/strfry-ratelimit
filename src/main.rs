@@ -51,6 +51,24 @@ struct Config {
     total_rate_per_sec: f64,
     /// Bucket depth for the all-kinds ceiling.
     total_burst: f64,
+    /// How a ceiling answers a shed event. `false` (default) = `reject` with a
+    /// `rate-limited:` reason, which cooperative clients key on to back off (strfry's own
+    /// limiter uses the same prefix; Trystero >= 0.25.4 honours it). `true` = `shadowReject`
+    /// (sender sees OK, nothing stored) — useful against a source you don't want to tip off.
+    ceiling_shadow: bool,
+}
+
+/// Reason attached to a ceiling `reject`. The `rate-limited:` prefix is load-bearing: it is
+/// what well-behaved clients match on to slow down, so keep it even if the wording changes.
+const CEILING_REJECT_MSG: &str = "rate-limited: relay ceiling exceeded, slow down";
+
+/// Verdict for an event a ceiling decided to shed.
+fn shed_verdict(cfg: &Config) -> (&'static str, &'static str) {
+    if cfg.ceiling_shadow {
+        ("shadowReject", "")
+    } else {
+        ("reject", CEILING_REJECT_MSG)
+    }
 }
 
 /// Token bucket for the relay-wide ephemeral ceiling. Refills at `rate` tokens/sec up to
@@ -221,6 +239,9 @@ impl Config {
             ephemeral_burst: burst,
             total_rate_per_sec: total_rate,
             total_burst,
+            ceiling_shadow: get("ceiling_mode")
+                .map(|m| m.trim().eq_ignore_ascii_case("shadow"))
+                .unwrap_or(false),
         }
     }
     /// Config from environment variables: generic key `foo_bar` reads env `RL_FOO_BAR`.
@@ -377,7 +398,7 @@ fn main() {
     let mut total_meter = ShedMeter::default();
 
     eprintln!(
-        "strfry-ratelimit: source={} window={}s max={} banOnExceed={} blockSingles={:?} blockRanges={:?} excludeKinds={:?} exempt(eph={},repl={},addr={}) ephemeralCeiling={} totalCeiling={} banned_loaded={}",
+        "strfry-ratelimit: source={} window={}s max={} banOnExceed={} blockSingles={:?} blockRanges={:?} excludeKinds={:?} exempt(eph={},repl={},addr={}) ephemeralCeiling={} totalCeiling={} ceilingMode={} banned_loaded={}",
         cfg_path.as_deref().unwrap_or("env"), cfg.window_seconds, cfg.max_events, cfg.ban_on_exceed,
         cfg.block_singles, cfg.block_ranges, cfg.exclude_kinds, cfg.exempt_ephemeral,
         cfg.exempt_replaceable, cfg.exempt_addressable,
@@ -391,6 +412,7 @@ fn main() {
         } else {
             "off".to_string()
         },
+        if cfg.ceiling_shadow { "shadow" } else { "reject" },
         banned.len()
     );
 
@@ -523,7 +545,10 @@ fn main() {
             (Some(k), Some(pk)) => (k, pk),
             _ => {
                 // Nothing to rate-limit against, but a shed event must still not be stored.
-                respond(&mut out, id, if shed { "shadowReject" } else { "accept" }, "");
+                {
+                let (action, msg) = if shed { shed_verdict(&cfg) } else { ("accept", "") };
+                respond(&mut out, id, action, msg);
+            }
                 continue;
             }
         };
@@ -536,7 +561,10 @@ fn main() {
         if !subject {
             // Exempt from the per-pubkey limiter, but the ceiling still applies: an exempt
             // ephemeral kind is exactly what a flood uses.
-            respond(&mut out, id, if shed { "shadowReject" } else { "accept" }, "");
+            {
+                let (action, msg) = if shed { shed_verdict(&cfg) } else { ("accept", "") };
+                respond(&mut out, id, action, msg);
+            }
             continue;
         }
 
@@ -570,7 +598,10 @@ fn main() {
 
         bucket.push_back(now);
         // Counted against the pubkey either way; shed events are simply not stored.
-        respond(&mut out, id, if shed { "shadowReject" } else { "accept" }, "");
+        {
+                let (action, msg) = if shed { shed_verdict(&cfg) } else { ("accept", "") };
+                respond(&mut out, id, action, msg);
+            }
 
         // Periodically evict expired/empty buckets to bound memory.
         processed = processed.wrapping_add(1);

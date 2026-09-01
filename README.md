@@ -65,6 +65,7 @@ relay {
 | `RL_EPHEMERAL_BURST`   | auto    | Bucket depth for the ceiling — instantaneous burst allowed before the sustained rate applies. Unset/too small becomes `max(rate, 1)` (with a warning) |
 | `RL_TOTAL_RATE_PER_SEC` | `0` (off) | Relay-wide ceiling across **all** kinds, events/second — the backstop for a flood that moves outside the ephemeral range |
 | `RL_TOTAL_BURST`       | auto    | Bucket depth for the all-kinds ceiling |
+| `RL_CEILING_MODE`      | `reject`| How a ceiling answers a shed event: `reject` (OK false, `rate-limited:` reason — lets cooperative clients back off) or `shadow` (OK true, silently dropped) |
 
 Example tuned for a busy relay (≈100 spam events/min must be caught, legit bursts ≈30 must pass):
 
@@ -84,8 +85,14 @@ It is **kind-agnostic**, so unlike `RL_BLOCK_KINDS` it does not need to know
 which kind is being abused and cannot be evaded by switching to another
 ephemeral kind. (An attacker who leaves the ephemeral range entirely — e.g.
 kind 1 — exits this ceiling and falls back on the per-pubkey limiter.)
-Over-limit events get `shadowReject` (the sender sees OK, nothing is stored or
-broadcast), so a flood source gets no signal to change tactics.
+Over-limit events are answered `["OK", id, false, "rate-limited: …"]` by
+default. The `rate-limited:` prefix matters: it is the same one strfry's built-in
+limiter uses, and cooperative clients key on it to back off (Trystero ≥ 0.25.4,
+for example, widens its announce interval up to 15 minutes on seeing it). That
+turns the ceiling from a wall into a signal, and a well-behaved source reduces
+its own load. Set `RL_CEILING_MODE=shadow` to answer `shadowReject` instead
+(sender sees OK, nothing is stored or broadcast) for a source you deliberately
+don't want to tip off.
 
 **What it does and does not protect.** This is a single first-come-first-served
 budget with no per-sender fairness: during a flood, tokens are won roughly in
