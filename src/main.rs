@@ -3,11 +3,11 @@
 //! strfry sends one JSON request per line on stdin and expects one JSON response per line on
 //! stdout. See https://github.com/hoytech/strfry/blob/master/docs/plugins.md
 //!
-//! Parsing: instead of a full JSON parse we byte-scan the request line for only the four fields we
-//! need (type, id, pubkey, kind). strfry's request is machine-generated, and any `"kind":` /
+//! Parsing: instead of a full JSON parse we byte-scan the request line for only the fields we
+//! need (type, id, pubkey, kind, sourceInfo). strfry's request is machine-generated, and any `"kind":` /
 //! `"pubkey":` / `"id":` appearing inside a string *value* is escaped (`\"`), so these
 //! key patterns never false-match content/tags. This drops the serde dependency and avoids a
-//! parse+allocation per event. Whitespace after the colon is tolerated (compact or pretty JSON).
+//! full JSON parse and its allocations on every event. Whitespace after the colon is tolerated (compact or pretty JSON).
 //!
 //! Design:
 //! - Kind blocklist (RL_BLOCK_KINDS) is checked first and drops matching kinds outright. Useful for
@@ -17,6 +17,9 @@
 //!   (0/3/41/10000-19999) cannot be used for storage abuse and are exempt by default; addressable
 //!   (30000-39999) is opt-in. A sliding window separates legit bursts from sustained spam. State is
 //!   in-memory (single long-lived process); bans optionally persist to a file to survive restarts.
+//! - Accepted event IDs are remembered for one sliding window so concurrent direct/forwarded
+//!   copies cannot inflate a pubkey's count. Trusted forwarding sources can also be excluded from
+//!   only the per-pubkey window while remaining subject to existing bans and global ceilings.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::OpenOptions;
@@ -41,6 +44,10 @@ struct Config {
     block_ephemeral_sources: HashSet<String>,
     /// `true` returns shadowReject for a blocked source; `false` returns an explicit rejection.
     block_source_shadow: bool,
+    /// Exact writePolicy sourceInfo values excluded from the per-pubkey sliding window. These
+    /// are trusted forwarders whose copies can race direct delivery of the same events. They
+    /// still consume relay-wide ceilings, and the persistent banlist still applies.
+    exempt_rate_limit_sources: HashSet<String>,
     /// Relay-wide ceiling on ephemeral events (kinds 20000-29999), in events per second.
     /// 0 disables it. Unlike the per-pubkey limit this is a single global budget, which is what
     /// catches a *distributed* flood: hundreds of pubkeys/IPs each sending a modest rate sum to a
@@ -288,6 +295,14 @@ impl Config {
                 false
             }
         };
+        let exempt_rate_limit_sources = get("exempt_rate_limit_sources")
+            .map(|v| {
+                v.split(',')
+                    .map(|s| s.trim().to_ascii_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
         Config {
             window_seconds: u64_of("window_seconds", 60),
             max_events: u64_of("max_events", 10),
@@ -302,6 +317,7 @@ impl Config {
             block_ranges,
             block_ephemeral_sources,
             block_source_shadow,
+            exempt_rate_limit_sources,
             ephemeral_rate_per_sec: rate,
             ephemeral_burst: burst,
             total_rate_per_sec: total_rate,
@@ -335,7 +351,7 @@ impl Config {
         Some(Self::from_lookup(|k| map.get(k).cloned()))
     }
     fn is_blocked(&self, kind: u64) -> bool {
-        self.block_singles.iter().any(|&k| k == kind)
+        self.block_singles.contains(&kind)
             || self
                 .block_ranges
                 .iter()
@@ -346,6 +362,12 @@ impl Config {
             && !source.is_empty()
             && self
                 .block_ephemeral_sources
+                .contains(&source.to_ascii_lowercase())
+    }
+    fn exempts_rate_limit_source(&self, source: &str) -> bool {
+        !source.is_empty()
+            && self
+                .exempt_rate_limit_sources
                 .contains(&source.to_ascii_lowercase())
     }
 }
@@ -472,6 +494,11 @@ fn main() {
     let mut ban_mtime = ban_path.as_deref().and_then(mtime);
 
     let mut buckets: HashMap<String, VecDeque<u64>> = HashMap::new();
+    // Event IDs that this plugin accepted recently. strfry's Ingester checks the DB before
+    // writePolicy, but two sources can both pass that check before Writer commits either copy.
+    // Remembering accepted IDs prevents that race from charging one logical event twice.
+    let mut accepted_ids: HashSet<String> = HashSet::new();
+    let mut accepted_id_order: VecDeque<(u64, String)> = VecDeque::new();
     // Relay-wide ephemeral budget. Sized from the current config; a hot-reload that raises the
     // burst is picked up by allow()'s clamp on the next event.
     let mut eph_bucket = TokenBucket::new(cfg.ephemeral_burst);
@@ -481,10 +508,10 @@ fn main() {
     let mut source_block_meter = ShedMeter::default();
 
     eprintln!(
-        "strfry-ratelimit: source={} window={}s max={} banOnExceed={} blockSingles={:?} blockRanges={:?} blockEphemeralSources={:?} blockSourceMode={} excludeKinds={:?} exempt(eph={},repl={},addr={}) ephemeralCeiling={} totalCeiling={} ceilingMode={} banned_loaded={}",
+        "strfry-ratelimit: source={} window={}s max={} banOnExceed={} blockSingles={:?} blockRanges={:?} blockEphemeralSources={:?} blockSourceMode={} exemptRateLimitSources={:?} excludeKinds={:?} exempt(eph={},repl={},addr={}) ephemeralCeiling={} totalCeiling={} ceilingMode={} banned_loaded={}",
         cfg_path.as_deref().unwrap_or("env"), cfg.window_seconds, cfg.max_events, cfg.ban_on_exceed,
         cfg.block_singles, cfg.block_ranges, cfg.block_ephemeral_sources,
-        if cfg.block_source_shadow { "shadow" } else { "reject" }, cfg.exclude_kinds,
+        if cfg.block_source_shadow { "shadow" } else { "reject" }, cfg.exempt_rate_limit_sources, cfg.exclude_kinds,
         cfg.exempt_ephemeral, cfg.exempt_replaceable, cfg.exempt_addressable,
         if cfg.ephemeral_rate_per_sec > 0.0 {
             format!("{}/s burst {}", cfg.ephemeral_rate_per_sec, cfg.ephemeral_burst)
@@ -518,6 +545,8 @@ fn main() {
         // Hot-reload config + banlist periodically (throttled; a cheap mtime stat, no re-read
         // unless the file actually changed). In-memory rate-limit state is preserved across reloads.
         tick = tick.wrapping_add(1);
+        // Keep modulo syntax compatible with the Rust 1.81 toolchain on Ubuntu 24.04.
+        #[allow(clippy::manual_is_multiple_of)]
         if tick % 64 == 0 {
             if let Some(p) = &cfg_path {
                 let m = mtime(p);
@@ -534,9 +563,10 @@ fn main() {
                             ban_mtime = ban_path.as_deref().and_then(mtime);
                         }
                         eprintln!(
-                            "strfry-ratelimit: reloaded config from {p} (blockEphemeralSources={:?} blockSourceMode={} ephemeralCeiling={} totalCeiling={} ceilingMode={})",
+                            "strfry-ratelimit: reloaded config from {p} (blockEphemeralSources={:?} blockSourceMode={} exemptRateLimitSources={:?} ephemeralCeiling={} totalCeiling={} ceilingMode={})",
                             cfg.block_ephemeral_sources,
                             if cfg.block_source_shadow { "shadow" } else { "reject" },
+                            cfg.exempt_rate_limit_sources,
                             if cfg.ephemeral_rate_per_sec > 0.0 {
                                 format!("{}/s burst {}", cfg.ephemeral_rate_per_sec, cfg.ephemeral_burst)
                             } else {
@@ -579,6 +609,7 @@ fn main() {
         }
 
         let kind = scan_u64(buf, b"\"kind\":");
+        let source = std::str::from_utf8(scan_str(buf, b"\"sourceInfo\":")).unwrap_or("");
 
         // 1) Kind blocklist — cheap, drops floods outright before we extract pubkey or touch state.
         if let Some(k) = kind {
@@ -592,7 +623,6 @@ fn main() {
         // connections (including Cloudflare realIpHeader) and the upstream URL for stream/sync.
         // Check this before shared ceilings so blocked upstream traffic cannot drain their budget.
         if let Some(k) = kind {
-            let source = std::str::from_utf8(scan_str(buf, b"\"sourceInfo\":")).unwrap_or("");
             if cfg.blocks_ephemeral_source(k, source) {
                 source_block_meter.record_source_block(k, source);
                 let (action, msg) = if cfg.block_source_shadow {
@@ -680,13 +710,14 @@ fn main() {
         };
 
         // 3) Is this kind subject to rate limiting?
-        let subject = !cfg.exclude_kinds.contains(&kind)
-            && !(cfg.exempt_ephemeral && is_ephemeral(kind))
-            && !(cfg.exempt_replaceable && is_replaceable(kind))
-            && !(cfg.exempt_addressable && is_addressable(kind));
-        if !subject {
-            // Exempt from the per-pubkey limiter, but the ceiling still applies: an exempt
-            // ephemeral kind is exactly what a flood uses.
+        let subject = !(cfg.exclude_kinds.contains(&kind)
+            || (cfg.exempt_ephemeral && is_ephemeral(kind))
+            || (cfg.exempt_replaceable && is_replaceable(kind))
+            || (cfg.exempt_addressable && is_addressable(kind)));
+        if !subject || cfg.exempts_rate_limit_source(source) {
+            // Exempt from the per-pubkey limiter, but the ceiling still applies. Trusted
+            // forwarders are exempted only from attribution/BAN because their copies can race
+            // direct delivery; their traffic still consumes the relay's global budget.
             {
                 let (action, msg) = if shed {
                     shed_verdict(&cfg)
@@ -698,8 +729,39 @@ fn main() {
             continue;
         }
 
-        // 4) Sliding-window rate limit.
+        // 4) Count each accepted logical event ID at most once per sliding window. This cache is
+        // deliberately checked after the global ceiling (all network attempts still cost relay
+        // capacity) and stores only events we return `accept` for below. Shed/rate-limited events
+        // are not remembered, so retrying a rejected ID cannot bypass either limiter.
         let now = now_secs();
+        while let Some((seen_at, _)) = accepted_id_order.front() {
+            if *seen_at + cfg.window_seconds > now {
+                break;
+            }
+            if let Some((_, expired_id)) = accepted_id_order.pop_front() {
+                accepted_ids.remove(&expired_id);
+            }
+        }
+        let event_id = std::str::from_utf8(id).ok().and_then(|value| {
+            if value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()) {
+                Some(value.to_ascii_lowercase())
+            } else {
+                None
+            }
+        });
+        if let Some(event_id) = &event_id {
+            if accepted_ids.contains(event_id) {
+                let (action, msg) = if shed {
+                    shed_verdict(&cfg)
+                } else {
+                    ("accept", "")
+                };
+                respond(&mut out, id, action, msg);
+                continue;
+            }
+        }
+
+        // 5) Sliding-window rate limit.
         let bucket = buckets.entry(pubkey.clone()).or_default();
         while let Some(&front) = bucket.front() {
             if front + cfg.window_seconds <= now {
@@ -737,7 +799,15 @@ fn main() {
         }
 
         bucket.push_back(now);
-        // Counted against the pubkey either way; shed events are simply not stored.
+        // Counted against the pubkey either way; shed events are simply not stored. Remember only
+        // accepted IDs: a shed event may be retried, and that retry must face both limits again.
+        if !shed {
+            if let Some(event_id) = event_id {
+                if accepted_ids.insert(event_id.clone()) {
+                    accepted_id_order.push_back((now, event_id));
+                }
+            }
+        }
         {
             let (action, msg) = if shed {
                 shed_verdict(&cfg)
@@ -749,6 +819,8 @@ fn main() {
 
         // Periodically evict expired/empty buckets to bound memory.
         processed = processed.wrapping_add(1);
+        // Keep modulo syntax compatible with the Rust 1.81 toolchain on Ubuntu 24.04.
+        #[allow(clippy::manual_is_multiple_of)]
         if processed % 4096 == 0 {
             buckets.retain(|_, b| {
                 while let Some(&front) = b.front() {

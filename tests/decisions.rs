@@ -192,6 +192,100 @@ fn blocked_source_defaults_to_explicit_reject() {
     );
 }
 
+#[test]
+fn duplicate_accepted_event_ids_count_only_once() {
+    let mut p = Plugin::start(&[("RL_MAX_EVENTS", "2")]);
+    let first = format!("{:064x}", 1);
+    let second = format!("{:064x}", 2);
+    let third = format!("{:064x}", 3);
+
+    assert_eq!(p.send(&first, PK_A, 1), Verdict::Accept);
+    assert_eq!(p.send(&first, PK_A, 1), Verdict::Accept);
+    assert_eq!(
+        p.send_from(&first, PK_A, 1, "149.28.29.200"),
+        Verdict::Accept
+    );
+    assert_eq!(p.send(&second, PK_A, 1), Verdict::Accept);
+    assert_eq!(p.send(&third, PK_A, 1), Verdict::RateLimited);
+}
+
+#[test]
+fn configured_sources_are_exempt_only_from_per_pubkey_limit() {
+    let mut p = Plugin::start(&[
+        (
+            "RL_EXEMPT_RATE_LIMIT_SOURCES",
+            "149.28.29.200, 2001:DB8::10",
+        ),
+        ("RL_MAX_EVENTS", "2"),
+    ]);
+
+    for i in 0..20 {
+        assert_eq!(
+            p.send_from(&format!("{i:064x}"), PK_A, 1, "149.28.29.200"),
+            Verdict::Accept
+        );
+    }
+    // Matching is case-insensitive (relevant for URL sourceInfo; harmless for IP literals).
+    assert_eq!(
+        p.send_from(&format!("{:064x}", 100), PK_A, 1, "2001:db8::10"),
+        Verdict::Accept
+    );
+    assert_eq!(p.send(&format!("{:064x}", 101), PK_A, 1), Verdict::Accept);
+    assert_eq!(p.send(&format!("{:064x}", 102), PK_A, 1), Verdict::Accept);
+    assert_eq!(
+        p.send(&format!("{:064x}", 103), PK_A, 1),
+        Verdict::RateLimited
+    );
+}
+
+#[test]
+fn exempt_rate_limit_source_still_consumes_global_ceiling() {
+    let mut p = Plugin::start(&[
+        ("RL_EXEMPT_RATE_LIMIT_SOURCES", "149.28.29.200"),
+        ("RL_TOTAL_RATE_PER_SEC", "1"),
+        ("RL_TOTAL_BURST", "1"),
+    ]);
+    assert_eq!(
+        p.send_from(&format!("{:064x}", 1), PK_A, 1, "149.28.29.200"),
+        Verdict::Accept
+    );
+    assert_eq!(
+        p.send_from(&format!("{:064x}", 2), PK_A, 1, "149.28.29.200"),
+        Verdict::Shed
+    );
+}
+
+#[test]
+fn exempt_rate_limit_source_does_not_bypass_existing_ban() {
+    let dir = std::env::temp_dir().join(format!("srl-exempt-ban-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let ban_file = dir.join("bans.txt");
+    std::fs::write(&ban_file, format!("{PK_A}\n")).unwrap();
+    let mut p = Plugin::start(&[
+        ("RL_EXEMPT_RATE_LIMIT_SOURCES", "149.28.29.200"),
+        ("RL_BAN_LIST_FILE", ban_file.to_str().unwrap()),
+    ]);
+    assert_eq!(
+        p.send_from(&format!("{:064x}", 1), PK_A, 1, "149.28.29.200"),
+        Verdict::Banned
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn shed_event_id_is_not_cached_as_accepted() {
+    let mut p = Plugin::start(&[
+        ("RL_TOTAL_RATE_PER_SEC", "1"),
+        ("RL_TOTAL_BURST", "1"),
+        ("RL_MAX_EVENTS", "2"),
+    ]);
+    let accepted = format!("{:064x}", 1);
+    let shed = format!("{:064x}", 2);
+    assert_eq!(p.send(&accepted, PK_A, 1), Verdict::Accept);
+    assert_eq!(p.send(&shed, PK_A, 1), Verdict::Shed);
+    assert_eq!(p.send(&shed, PK_A, 1), Verdict::RateLimited);
+}
+
 /// The ceiling sheds a distributed flood that no per-pubkey limit could see.
 #[test]
 fn ceiling_sheds_distributed_flood() {
