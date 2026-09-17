@@ -11,9 +11,10 @@ separate process that strfry talks to over stdin/stdout, so it works with stock/
   inclusive ranges) are rejected outright, before rate limiting. This catches ephemeral floods
   (e.g. relayed WebRTC signaling) that per-pubkey rate limiting can't stop because each event
   uses a throwaway pubkey.
-- **Per-pubkey sliding-window rate limit.** Up to `RL_MAX_EVENTS` accepted per `RL_WINDOW_SECONDS`
-  per pubkey. A longer window separates one-time bursts (fixed count) from sustained spam (which
-  scales with the window), so a generous window tolerates legit bursts while still catching floods.
+- **Per-pubkey sliding-window rate limit.** Up to `RL_MAX_EVENTS` distinct accepted event IDs per
+  `RL_WINDOW_SECONDS` per pubkey. Re-delivery of an already accepted ID is not charged again, so
+  direct and forwarded copies racing before strfry commits cannot inflate the count. A longer
+  window separates one-time bursts from sustained spam.
 - **Kind-class aware.** Only *accumulating* kinds are limited:
   - **Ephemeral** (20000–29999): never stored → exempt by default.
   - **Replaceable** (0, 3, 41, 10000–19999): only the latest per (pubkey,kind) is stored → exempt.
@@ -23,8 +24,11 @@ separate process that strfry talks to over stdin/stdout, so it works with stock/
   (`RL_EPHEMERAL_RATE_PER_SEC`), for *distributed* floods that spread across many pubkeys so no
   per-sender limit can see them. Kind-agnostic, so it survives an attacker switching kinds.
   Off by default — [see below](#relay-wide-ephemeral-ceiling-distributed-flood-defence).
+- **Trusted-forwarder exemption.** Exact `sourceInfo` values in
+  `RL_EXEMPT_RATE_LIMIT_SOURCES` skip only the per-pubkey window, preventing a known bridge's
+  copies from being attributed to end users. Banlist checks and relay-wide ceilings still apply.
 - **Optional auto-ban.** When `RL_BAN_ON_EXCEED=true`, a pubkey that exceeds the limit is banned
-  (all its events rejected) and persisted to `RL_BAN_LIST_FILE`. Remove the line and restart to unban.
+  (all its events rejected) and persisted to `RL_BAN_LIST_FILE`. Remove the line to unban.
 
 ## Build
 
@@ -54,6 +58,7 @@ relay {
 | `RL_BLOCK_KINDS`        | (none)  | Kinds dropped outright, before rate limiting. Comma-separated singles and/or `lo-hi` ranges, e.g. `20001,22000-22999` |
 | `RL_BLOCK_EPHEMERAL_SOURCES` | (none) | Exact comma-separated `sourceInfo` values whose ephemeral events (20000–29999) are blocked, e.g. client IPs or stream URLs |
 | `RL_BLOCK_SOURCE_MODE` | `reject` | Verdict for source-specific blocking: `reject` (OK false with reason) or `shadow` (OK true, silently dropped) |
+| `RL_EXEMPT_RATE_LIMIT_SOURCES` | (none) | Exact comma-separated trusted `sourceInfo` values excluded only from the per-pubkey window; global ceilings and existing bans still apply |
 | `RL_WINDOW_SECONDS`    | `60`    | Sliding window length (seconds) |
 | `RL_MAX_EVENTS`        | `10`    | Max accepted events per window per pubkey |
 | `RL_MODE`              | `reject`| `reject` (OK false) or `shadow` (OK true but dropped) |
@@ -95,6 +100,26 @@ unaffected. Matching is exact and case-insensitive; keep configured addresses
 updated if the upstream moves. Source-blocked events are rejected before shared
 ceilings and therefore cannot drain their budgets. `shadow` avoids one strfry
 INFO line per blocked event; use `reject` when the source can act on the reason.
+
+### Duplicate delivery and trusted forwarders
+
+strfry checks for an existing event before writePolicy, but copies arriving concurrently can both
+pass that check before Writer commits either one. The plugin therefore remembers event IDs it
+returns `accept` for during `RL_WINDOW_SECONDS`; another copy of the same ID still consumes the
+relay-wide ceiling but is not charged to the pubkey again. Shed or per-pubkey-rejected IDs are not
+cached, so retrying rejected traffic cannot bypass a limit.
+
+A bridge can also race a writer outside the relay process, meaning writePolicy may see only the
+bridge's already-stored copy. List trusted bridge IPs or stream URLs in
+`RL_EXEMPT_RATE_LIMIT_SOURCES` to keep those copies out of end-user attribution:
+
+```sh
+RL_EXEMPT_RATE_LIMIT_SOURCES=149.28.29.200,2001:db8::10
+```
+
+This is deliberately narrower than a general allowlist. Existing bans are checked first, and every
+attempt still consumes the relay-wide ceilings. Only the per-pubkey sliding window is skipped.
+Use it only for sources you operate or intentionally trust.
 
 ### Relay-wide ephemeral ceiling (distributed-flood defence)
 
@@ -187,7 +212,7 @@ to do the fine-grained work. Off by default.
 Set `RL_CONFIG_FILE=/path/to/strfry-ratelimit.conf` to load settings from a file instead of
 environment variables. The file is `key = value` (`#` starts a comment); keys are the env names
 **without** the `RL_` prefix, lowercased — e.g. `window_seconds`, `max_events`, `block_kinds`,
-`block_ephemeral_sources`, `ban_list_file`. See [`examples/strfry-ratelimit.conf`](examples/strfry-ratelimit.conf).
+`block_ephemeral_sources`, `exempt_rate_limit_sources`, `ban_list_file`. See [`examples/strfry-ratelimit.conf`](examples/strfry-ratelimit.conf).
 
 The plugin **re-reads the config file and the banlist when they change (by mtime)**, so you can
 adjust blocked kinds/sources, rate limits, exemptions, and bans/unbans **without restarting strfry**.
@@ -201,14 +226,13 @@ If `RL_CONFIG_FILE` is unset, configuration comes from environment variables exa
 
 - strfry calls the plugin synchronously (one event at a time), so per-event work must be cheap.
   This plugin does only bounded string/hash lookups + deque pruning (microseconds), suitable for
-  high-throughput relays.
+  high-throughput relays. Accepted-ID cache entries expire with the configured sliding window.
 - IP-based limiting is intentionally **not** enabled: the client IP is available in the request
   (`sourceInfo`), but banning IPs causes heavy collateral damage when legitimate aggregator relays
   or apps forward many users from one address. Pubkey-level limiting is the safer default.
 - State is in memory; only bans persist (to `RL_BAN_LIST_FILE`).
 - Parsing is dependency-free: the request line is byte-scanned for just `type`/`id`/`pubkey`/`kind`/`sourceInfo`
-  (a `"kind":` etc. inside a string value is escaped, so it never false-matches). No serde, no
-  allocation per event.
+  (a `"kind":` etc. inside a string value is escaped, so it never false-matches). No serde.
 
 ## License
 
