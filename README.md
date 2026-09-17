@@ -52,6 +52,8 @@ relay {
 |------------------------|---------|---------|
 | `RL_CONFIG_FILE`       | (none)  | Load settings from this file instead of env vars; hot-reloaded on change (see below) |
 | `RL_BLOCK_KINDS`        | (none)  | Kinds dropped outright, before rate limiting. Comma-separated singles and/or `lo-hi` ranges, e.g. `20001,22000-22999` |
+| `RL_BLOCK_EPHEMERAL_SOURCES` | (none) | Exact comma-separated `sourceInfo` values whose ephemeral events (20000–29999) are blocked, e.g. client IPs or stream URLs |
+| `RL_BLOCK_SOURCE_MODE` | `reject` | Verdict for source-specific blocking: `reject` (OK false with reason) or `shadow` (OK true, silently dropped) |
 | `RL_WINDOW_SECONDS`    | `60`    | Sliding window length (seconds) |
 | `RL_MAX_EVENTS`        | `10`    | Max accepted events per window per pubkey |
 | `RL_MODE`              | `reject`| `reject` (OK false) or `shadow` (OK true but dropped) |
@@ -73,6 +75,26 @@ Example tuned for a busy relay (≈100 spam events/min must be caught, legit bur
 RL_WINDOW_SECONDS=180 RL_MAX_EVENTS=100 RL_BAN_ON_EXCEED=true \
 RL_BAN_LIST_FILE=./strfry-db/banned-pubkeys.txt
 ```
+
+### Source-specific ephemeral blocking
+
+`RL_BLOCK_EPHEMERAL_SOURCES` blocks ephemeral events only when the writePolicy
+`sourceInfo` exactly matches a configured value. For direct relay connections,
+`sourceInfo` is the client IP (or the address restored by strfry's
+`realIpHeader`); for stream/sync inputs it is the upstream URL. This is useful
+when one known forwarding relay contributes unwanted ephemeral traffic but
+other clients must retain full ephemeral support:
+
+```sh
+RL_BLOCK_EPHEMERAL_SOURCES=149.28.29.200,2001:db8::10
+RL_BLOCK_SOURCE_MODE=shadow
+```
+
+Non-ephemeral events from that source and all events from other sources remain
+unaffected. Matching is exact and case-insensitive; keep configured addresses
+updated if the upstream moves. Source-blocked events are rejected before shared
+ceilings and therefore cannot drain their budgets. `shadow` avoids one strfry
+INFO line per blocked event; use `reject` when the source can act on the reason.
 
 ### Relay-wide ephemeral ceiling (distributed-flood defence)
 
@@ -165,10 +187,10 @@ to do the fine-grained work. Off by default.
 Set `RL_CONFIG_FILE=/path/to/strfry-ratelimit.conf` to load settings from a file instead of
 environment variables. The file is `key = value` (`#` starts a comment); keys are the env names
 **without** the `RL_` prefix, lowercased — e.g. `window_seconds`, `max_events`, `block_kinds`,
-`ban_list_file`. See [`examples/strfry-ratelimit.conf`](examples/strfry-ratelimit.conf).
+`block_ephemeral_sources`, `ban_list_file`. See [`examples/strfry-ratelimit.conf`](examples/strfry-ratelimit.conf).
 
 The plugin **re-reads the config file and the banlist when they change (by mtime)**, so you can
-adjust `block_kinds`, rate limits, exemptions, and bans/unbans **without restarting strfry**.
+adjust blocked kinds/sources, rate limits, exemptions, and bans/unbans **without restarting strfry**.
 In-memory rate-limit state is preserved across reloads. (A change is detected within a few dozen
 processed events — effectively immediate on a busy relay.)
 
@@ -178,13 +200,13 @@ If `RL_CONFIG_FILE` is unset, configuration comes from environment variables exa
 ## Notes
 
 - strfry calls the plugin synchronously (one event at a time), so per-event work must be cheap.
-  This plugin does only a hashmap lookup + deque prune (microseconds), suitable for high-throughput
-  relays.
+  This plugin does only bounded string/hash lookups + deque pruning (microseconds), suitable for
+  high-throughput relays.
 - IP-based limiting is intentionally **not** enabled: the client IP is available in the request
   (`sourceInfo`), but banning IPs causes heavy collateral damage when legitimate aggregator relays
   or apps forward many users from one address. Pubkey-level limiting is the safer default.
 - State is in memory; only bans persist (to `RL_BAN_LIST_FILE`).
-- Parsing is dependency-free: the request line is byte-scanned for just `type`/`id`/`pubkey`/`kind`
+- Parsing is dependency-free: the request line is byte-scanned for just `type`/`id`/`pubkey`/`kind`/`sourceInfo`
   (a `"kind":` etc. inside a string value is escaped, so it never false-matches). No serde, no
   allocation per event.
 
