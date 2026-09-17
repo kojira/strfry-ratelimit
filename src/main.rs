@@ -35,6 +35,12 @@ struct Config {
     exempt_addressable: bool,
     block_singles: Vec<u64>,
     block_ranges: Vec<(u64, u64)>,
+    /// Exact writePolicy sourceInfo values whose ephemeral events are blocked. This allows a relay
+    /// operator to suppress ephemeral forwarding from one upstream/source without disabling
+    /// ephemeral events for direct clients or other relays.
+    block_ephemeral_sources: HashSet<String>,
+    /// `true` returns shadowReject for a blocked source; `false` returns an explicit rejection.
+    block_source_shadow: bool,
     /// Relay-wide ceiling on ephemeral events (kinds 20000-29999), in events per second.
     /// 0 disables it. Unlike the per-pubkey limit this is a single global budget, which is what
     /// catches a *distributed* flood: hundreds of pubkeys/IPs each sending a modest rate sum to a
@@ -82,7 +88,10 @@ struct TokenBucket {
 
 impl TokenBucket {
     fn new(burst: f64) -> Self {
-        TokenBucket { tokens: burst, last: std::time::Instant::now() }
+        TokenBucket {
+            tokens: burst,
+            last: std::time::Instant::now(),
+        }
     }
     /// Try to spend one token, refilling first. Returns false when the budget is exhausted.
     fn allow(&mut self, rate: f64, burst: f64) -> bool {
@@ -124,6 +133,26 @@ impl ShedMeter {
                 ),
                 Some(s) => eprintln!(
                     "strfry-ratelimit: {label} ({rate}/s burst {burst}) shed {} events in the last {s:.0}s (total {}, latest kind {kind})",
+                    self.total.wrapping_sub(self.logged), self.total
+                ),
+            }
+            self.last = Some(now);
+            self.logged = self.total;
+        }
+    }
+
+    fn record_source_block(&mut self, kind: u64, source: &str) {
+        self.total = self.total.wrapping_add(1);
+        let now = std::time::Instant::now();
+        let since = self.last.map(|t| now.duration_since(t).as_secs_f64());
+        #[allow(clippy::unnecessary_map_or)]
+        if since.map_or(true, |s| s >= 10.0) {
+            match since {
+                None => eprintln!(
+                    "strfry-ratelimit: blocked ephemeral source {source} engaged (latest kind {kind})"
+                ),
+                Some(s) => eprintln!(
+                    "strfry-ratelimit: blocked ephemeral source {source} dropped {} events in the last {s:.0}s (total {}, latest kind {kind})",
                     self.total.wrapping_sub(self.logged), self.total
                 ),
             }
@@ -179,7 +208,12 @@ impl Config {
         let u64_of = |k: &str, d: u64| get(k).and_then(|v| v.trim().parse().ok()).unwrap_or(d);
         let bool_of = |k: &str, d: bool| {
             get(k)
-                .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+                .map(|v| {
+                    matches!(
+                        v.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                })
                 .unwrap_or(d)
         };
         let kinds_of = |k: &str, d: &[u64]| -> HashSet<u64> {
@@ -233,7 +267,27 @@ impl Config {
                 false
             }
         };
-        let (block_singles, block_ranges) = parse_kind_list(&get("block_kinds").unwrap_or_default());
+        let (block_singles, block_ranges) =
+            parse_kind_list(&get("block_kinds").unwrap_or_default());
+        let block_ephemeral_sources = get("block_ephemeral_sources")
+            .map(|v| {
+                v.split(',')
+                    .map(|s| s.trim().to_ascii_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let block_source_shadow = match get("block_source_mode")
+            .map(|m| m.trim().to_ascii_lowercase())
+        {
+            None => false,
+            Some(m) if m.is_empty() || m == "reject" => false,
+            Some(m) if m == "shadow" => true,
+            Some(m) => {
+                eprintln!("strfry-ratelimit: ignoring invalid block_source_mode value {m:?} (want reject or shadow); using reject");
+                false
+            }
+        };
         Config {
             window_seconds: u64_of("window_seconds", 60),
             max_events: u64_of("max_events", 10),
@@ -246,6 +300,8 @@ impl Config {
             exempt_addressable: bool_of("exempt_addressable", false),
             block_singles,
             block_ranges,
+            block_ephemeral_sources,
+            block_source_shadow,
             ephemeral_rate_per_sec: rate,
             ephemeral_burst: burst,
             total_rate_per_sec: total_rate,
@@ -280,7 +336,17 @@ impl Config {
     }
     fn is_blocked(&self, kind: u64) -> bool {
         self.block_singles.iter().any(|&k| k == kind)
-            || self.block_ranges.iter().any(|&(lo, hi)| lo <= kind && kind <= hi)
+            || self
+                .block_ranges
+                .iter()
+                .any(|&(lo, hi)| lo <= kind && kind <= hi)
+    }
+    fn blocks_ephemeral_source(&self, kind: u64, source: &str) -> bool {
+        is_ephemeral(kind)
+            && !source.is_empty()
+            && self
+                .block_ephemeral_sources
+                .contains(&source.to_ascii_lowercase())
     }
 }
 
@@ -294,7 +360,10 @@ fn is_addressable(kind: u64) -> bool {
     (30_000..40_000).contains(&kind)
 }
 fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// First index of `needle` in `hay`, or None.
@@ -382,10 +451,14 @@ fn respond(out: &mut impl Write, id: &[u8], action: &str, msg: &str) {
 fn main() {
     // Config from a file if RL_CONFIG_FILE is set (hot-reloaded on mtime change), else from
     // environment variables (read once at startup — fully backward compatible).
-    let cfg_path = std::env::var("RL_CONFIG_FILE").ok().filter(|s| !s.is_empty());
+    let cfg_path = std::env::var("RL_CONFIG_FILE")
+        .ok()
+        .filter(|s| !s.is_empty());
     let mut cfg = match &cfg_path {
         Some(p) => Config::from_file(p).unwrap_or_else(|| {
-            eprintln!("strfry-ratelimit: config file {p} unreadable/empty at startup; using defaults");
+            eprintln!(
+                "strfry-ratelimit: config file {p} unreadable/empty at startup; using defaults"
+            );
             Config::from_lookup(|_| None)
         }),
         None => Config::from_env(),
@@ -405,12 +478,14 @@ fn main() {
     let mut total_bucket = TokenBucket::new(cfg.total_burst);
     let mut eph_meter = ShedMeter::default();
     let mut total_meter = ShedMeter::default();
+    let mut source_block_meter = ShedMeter::default();
 
     eprintln!(
-        "strfry-ratelimit: source={} window={}s max={} banOnExceed={} blockSingles={:?} blockRanges={:?} excludeKinds={:?} exempt(eph={},repl={},addr={}) ephemeralCeiling={} totalCeiling={} ceilingMode={} banned_loaded={}",
+        "strfry-ratelimit: source={} window={}s max={} banOnExceed={} blockSingles={:?} blockRanges={:?} blockEphemeralSources={:?} blockSourceMode={} excludeKinds={:?} exempt(eph={},repl={},addr={}) ephemeralCeiling={} totalCeiling={} ceilingMode={} banned_loaded={}",
         cfg_path.as_deref().unwrap_or("env"), cfg.window_seconds, cfg.max_events, cfg.ban_on_exceed,
-        cfg.block_singles, cfg.block_ranges, cfg.exclude_kinds, cfg.exempt_ephemeral,
-        cfg.exempt_replaceable, cfg.exempt_addressable,
+        cfg.block_singles, cfg.block_ranges, cfg.block_ephemeral_sources,
+        if cfg.block_source_shadow { "shadow" } else { "reject" }, cfg.exclude_kinds,
+        cfg.exempt_ephemeral, cfg.exempt_replaceable, cfg.exempt_addressable,
         if cfg.ephemeral_rate_per_sec > 0.0 {
             format!("{}/s burst {}", cfg.ephemeral_rate_per_sec, cfg.ephemeral_burst)
         } else {
@@ -459,7 +534,9 @@ fn main() {
                             ban_mtime = ban_path.as_deref().and_then(mtime);
                         }
                         eprintln!(
-                            "strfry-ratelimit: reloaded config from {p} (ephemeralCeiling={} totalCeiling={} ceilingMode={})",
+                            "strfry-ratelimit: reloaded config from {p} (blockEphemeralSources={:?} blockSourceMode={} ephemeralCeiling={} totalCeiling={} ceilingMode={})",
+                            cfg.block_ephemeral_sources,
+                            if cfg.block_source_shadow { "shadow" } else { "reject" },
                             if cfg.ephemeral_rate_per_sec > 0.0 {
                                 format!("{}/s burst {}", cfg.ephemeral_rate_per_sec, cfg.ephemeral_burst)
                             } else {
@@ -511,6 +588,26 @@ fn main() {
             }
         }
 
+        // 1b) Source-specific ephemeral block. `sourceInfo` is the original client IP for relay
+        // connections (including Cloudflare realIpHeader) and the upstream URL for stream/sync.
+        // Check this before shared ceilings so blocked upstream traffic cannot drain their budget.
+        if let Some(k) = kind {
+            let source = std::str::from_utf8(scan_str(buf, b"\"sourceInfo\":")).unwrap_or("");
+            if cfg.blocks_ephemeral_source(k, source) {
+                source_block_meter.record_source_block(k, source);
+                let (action, msg) = if cfg.block_source_shadow {
+                    ("shadowReject", "")
+                } else {
+                    (
+                        "reject",
+                        "blocked: ephemeral events from this source are not accepted",
+                    )
+                };
+                respond(&mut out, id, action, msg);
+                continue;
+            }
+        }
+
         // pubkey should be 64 hex; None if unreadable (then it can't be banned or rate-limited).
         let pubkey = match std::str::from_utf8(scan_str(buf, b"\"pubkey\":")) {
             Ok(s) if !s.is_empty() => Some(s.to_ascii_lowercase()),
@@ -542,7 +639,12 @@ fn main() {
                 && !eph_bucket.allow(cfg.ephemeral_rate_per_sec, cfg.ephemeral_burst)
             {
                 shed = true;
-                eph_meter.record(k, "ephemeral ceiling", cfg.ephemeral_rate_per_sec, cfg.ephemeral_burst);
+                eph_meter.record(
+                    k,
+                    "ephemeral ceiling",
+                    cfg.ephemeral_rate_per_sec,
+                    cfg.ephemeral_burst,
+                );
             }
             // All-kinds ceiling: the backstop for a flood that moves outside 20000-29999.
             // Charged only if the event survived above, so one event never costs two budgets.
@@ -551,7 +653,12 @@ fn main() {
                 && !total_bucket.allow(cfg.total_rate_per_sec, cfg.total_burst)
             {
                 shed = true;
-                total_meter.record(k, "all-kinds ceiling", cfg.total_rate_per_sec, cfg.total_burst);
+                total_meter.record(
+                    k,
+                    "all-kinds ceiling",
+                    cfg.total_rate_per_sec,
+                    cfg.total_burst,
+                );
             }
         }
 
@@ -561,9 +668,13 @@ fn main() {
             _ => {
                 // Nothing to rate-limit against, but a shed event must still not be stored.
                 {
-                let (action, msg) = if shed { shed_verdict(&cfg) } else { ("accept", "") };
-                respond(&mut out, id, action, msg);
-            }
+                    let (action, msg) = if shed {
+                        shed_verdict(&cfg)
+                    } else {
+                        ("accept", "")
+                    };
+                    respond(&mut out, id, action, msg);
+                }
                 continue;
             }
         };
@@ -577,7 +688,11 @@ fn main() {
             // Exempt from the per-pubkey limiter, but the ceiling still applies: an exempt
             // ephemeral kind is exactly what a flood uses.
             {
-                let (action, msg) = if shed { shed_verdict(&cfg) } else { ("accept", "") };
+                let (action, msg) = if shed {
+                    shed_verdict(&cfg)
+                } else {
+                    ("accept", "")
+                };
                 respond(&mut out, id, action, msg);
             }
             continue;
@@ -602,11 +717,21 @@ fn main() {
                     append_ban(path, &pubkey);
                 }
                 eprintln!("strfry-ratelimit: BANNED {pubkey} (exceeded rate limit)");
-                respond(&mut out, id, "reject", "blocked: pubkey is banned (rate limit exceeded)");
+                respond(
+                    &mut out,
+                    id,
+                    "reject",
+                    "blocked: pubkey is banned (rate limit exceeded)",
+                );
             } else if cfg.mode_shadow {
                 respond(&mut out, id, "shadowReject", "");
             } else {
-                respond(&mut out, id, "reject", "rate-limited: too many events, slow down");
+                respond(
+                    &mut out,
+                    id,
+                    "reject",
+                    "rate-limited: too many events, slow down",
+                );
             }
             continue;
         }
@@ -614,9 +739,13 @@ fn main() {
         bucket.push_back(now);
         // Counted against the pubkey either way; shed events are simply not stored.
         {
-                let (action, msg) = if shed { shed_verdict(&cfg) } else { ("accept", "") };
-                respond(&mut out, id, action, msg);
-            }
+            let (action, msg) = if shed {
+                shed_verdict(&cfg)
+            } else {
+                ("accept", "")
+            };
+            respond(&mut out, id, action, msg);
+        }
 
         // Periodically evict expired/empty buckets to bound memory.
         processed = processed.wrapping_add(1);
@@ -641,7 +770,9 @@ mod tests {
 
     fn cfg_with(rate: &str, burst: &str) -> Config {
         let map: HashMap<&str, &str> =
-            [("ephemeral_rate_per_sec", rate), ("ephemeral_burst", burst)].into_iter().collect();
+            [("ephemeral_rate_per_sec", rate), ("ephemeral_burst", burst)]
+                .into_iter()
+                .collect();
         Config::from_lookup(|k| map.get(k).map(|s| s.to_string()))
     }
 
@@ -651,7 +782,11 @@ mod tests {
     fn burst_too_small_is_raised_not_blackholed() {
         for b in ["0", "0.5", "-5"] {
             let c = cfg_with("5", b);
-            assert!(c.ephemeral_burst >= 1.0, "burst {b} left unusable: {}", c.ephemeral_burst);
+            assert!(
+                c.ephemeral_burst >= 1.0,
+                "burst {b} left unusable: {}",
+                c.ephemeral_burst
+            );
             let mut tb = TokenBucket::new(c.ephemeral_burst);
             assert!(
                 tb.allow(c.ephemeral_rate_per_sec, c.ephemeral_burst),
@@ -664,12 +799,19 @@ mod tests {
     #[test]
     fn invalid_values_are_rejected_to_zero() {
         for bad in ["5/s", "five", "nan", "inf", "-1"] {
-            assert_eq!(cfg_with(bad, "30").ephemeral_rate_per_sec, 0.0, "rate {bad}");
+            assert_eq!(
+                cfg_with(bad, "30").ephemeral_rate_per_sec,
+                0.0,
+                "rate {bad}"
+            );
         }
         // NaN/inf burst must not survive into the bucket clamp.
         for bad in ["nan", "inf"] {
             let c = cfg_with("5", bad);
-            assert!(c.ephemeral_burst.is_finite(), "burst {bad} stayed non-finite");
+            assert!(
+                c.ephemeral_burst.is_finite(),
+                "burst {bad} stayed non-finite"
+            );
         }
     }
 
@@ -685,7 +827,7 @@ mod tests {
         let (rate, burst) = (5.0, 10.0);
         let mut tb = TokenBucket::new(burst);
         let allowed = (0..50).filter(|_| tb.allow(rate, burst)).count();
-        assert_eq!(allowed, 10, "burst should be exactly {burst}");  // no sleep involved: exact
+        assert_eq!(allowed, 10, "burst should be exactly {burst}"); // no sleep involved: exact
         let t0 = std::time::Instant::now();
         std::thread::sleep(std::time::Duration::from_millis(600));
         let after = (0..50).filter(|_| tb.allow(rate, burst)).count();
@@ -694,7 +836,8 @@ mod tests {
         let earned = t0.elapsed().as_secs_f64() * rate;
         assert!(
             after >= 2 && (after as f64) <= earned + 1.0,
-            "refilled {after} in {:.2}s at {rate}/s (earned {earned:.1})", t0.elapsed().as_secs_f64()
+            "refilled {after} in {:.2}s at {rate}/s (earned {earned:.1})",
+            t0.elapsed().as_secs_f64()
         );
     }
 

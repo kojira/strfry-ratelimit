@@ -52,20 +52,31 @@ impl Plugin {
             .expect("spawn plugin");
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
-        Plugin { child, stdin, stdout }
+        Plugin {
+            child,
+            stdin,
+            stdout,
+        }
     }
 
     /// Submit one event and return the raw verdict line.
     fn send_raw(&mut self, id: &str, pubkey: &str, kind: u64) -> String {
+        self.send_raw_from(id, pubkey, kind, "")
+    }
+
+    fn send_raw_from(&mut self, id: &str, pubkey: &str, kind: u64, source: &str) -> String {
         writeln!(
             self.stdin,
-            r#"{{"type":"new","event":{{"id":"{id}","pubkey":"{pubkey}","kind":{kind}}}}}"#
+            r#"{{"type":"new","sourceType":"IP4","sourceInfo":"{source}","event":{{"id":"{id}","pubkey":"{pubkey}","kind":{kind}}}}}"#
         )
         .unwrap();
         self.stdin.flush().unwrap();
         let mut line = String::new();
         self.stdout.read_line(&mut line).expect("plugin replied");
-        assert!(line.contains(&format!("\"id\":\"{id}\"")), "reply was for another event: {line}");
+        assert!(
+            line.contains(&format!("\"id\":\"{id}\"")),
+            "reply was for another event: {line}"
+        );
         line
     }
 
@@ -92,6 +103,10 @@ impl Plugin {
 
     fn send(&mut self, id: &str, pubkey: &str, kind: u64) -> Verdict {
         Self::classify(&self.send_raw(id, pubkey, kind))
+    }
+
+    fn send_from(&mut self, id: &str, pubkey: &str, kind: u64, source: &str) -> Verdict {
+        Self::classify(&self.send_raw_from(id, pubkey, kind, source))
     }
 
     fn tally(&mut self, n: usize, pubkey: &str, kind: u64) -> Tally {
@@ -136,6 +151,47 @@ impl Drop for Plugin {
 const PK_A: &str = "aa00000000000000000000000000000000000000000000000000000000000001";
 const PK_B: &str = "bb00000000000000000000000000000000000000000000000000000000000002";
 
+#[test]
+fn blocks_ephemeral_only_from_configured_sources() {
+    let mut p = Plugin::start(&[
+        (
+            "RL_BLOCK_EPHEMERAL_SOURCES",
+            "149.28.29.200, 2001:19f0:7002:191:0:bad:c0de:1337",
+        ),
+        ("RL_BLOCK_SOURCE_MODE", "shadow"),
+        ("RL_MAX_EVENTS", "1000000"),
+    ]);
+
+    let blocked_v4 = p.send_raw_from("01", PK_A, 27889, "149.28.29.200");
+    assert!(
+        blocked_v4.contains("\"action\":\"shadowReject\""),
+        "{blocked_v4}"
+    );
+    let blocked_v6 = p.send_raw_from("02", PK_A, 22587, "2001:19f0:7002:191:0:bad:c0de:1337");
+    assert!(
+        blocked_v6.contains("\"action\":\"shadowReject\""),
+        "{blocked_v6}"
+    );
+
+    assert_eq!(
+        p.send_from("03", PK_A, 27889, "203.0.113.10"),
+        Verdict::Accept
+    );
+    assert_eq!(p.send_from("04", PK_A, 1, "149.28.29.200"), Verdict::Accept);
+    assert_eq!(p.send_from("05", PK_A, 27889, ""), Verdict::Accept);
+}
+
+#[test]
+fn blocked_source_defaults_to_explicit_reject() {
+    let mut p = Plugin::start(&[("RL_BLOCK_EPHEMERAL_SOURCES", "149.28.29.200")]);
+    let line = p.send_raw_from("01", PK_A, 27889, "149.28.29.200");
+    assert!(line.contains("\"action\":\"reject\""), "{line}");
+    assert!(
+        line.contains("blocked: ephemeral events from this source"),
+        "{line}"
+    );
+}
+
 /// The ceiling sheds a distributed flood that no per-pubkey limit could see.
 #[test]
 fn ceiling_sheds_distributed_flood() {
@@ -159,7 +215,10 @@ fn ceiling_reject_reason_lets_clients_back_off() {
     ]);
     p.send_raw("00", PK_A, 22587); // spend the single token
     let line = p.send_raw("01", PK_A, 22587);
-    assert!(line.contains("\"action\":\"reject\""), "expected reject, got {line}");
+    assert!(
+        line.contains("\"action\":\"reject\""),
+        "expected reject, got {line}"
+    );
     assert!(
         line.contains("\"msg\":\"rate-limited:"),
         "reason must start with the rate-limited: prefix, got {line}"
@@ -176,8 +235,14 @@ fn total_ceiling_reject_reason_lets_clients_back_off() {
     ]);
     p.send_raw("00", PK_A, 1);
     let line = p.send_raw("01", PK_A, 1);
-    assert!(line.contains("\"action\":\"reject\""), "expected reject, got {line}");
-    assert!(line.contains("\"msg\":\"rate-limited:"), "missing rate-limited: prefix: {line}");
+    assert!(
+        line.contains("\"action\":\"reject\""),
+        "expected reject, got {line}"
+    );
+    assert!(
+        line.contains("\"msg\":\"rate-limited:"),
+        "missing rate-limited: prefix: {line}"
+    );
 }
 
 /// `ceiling_mode = shadow` keeps the old silent behaviour for sources you don't want to tip off.
@@ -190,7 +255,10 @@ fn ceiling_shadow_mode_answers_shadow_reject() {
     ]);
     p.send_raw("00", PK_A, 22587);
     let line = p.send_raw("01", PK_A, 22587);
-    assert!(line.contains("\"action\":\"shadowReject\""), "expected shadowReject, got {line}");
+    assert!(
+        line.contains("\"action\":\"shadowReject\""),
+        "expected shadowReject, got {line}"
+    );
 }
 
 /// Non-ephemeral traffic must be untouched by the ephemeral ceiling, even mid-flood.
@@ -220,9 +288,16 @@ fn banned_pubkey_does_not_drain_budget() {
         ("RL_BAN_LIST_FILE", ban_file.to_str().unwrap()),
     ]);
     let t = p.tally(100, PK_A, 22587);
-    assert_eq!((t.banned, t.shed, t.accept), (100, 0, 0), "banned pubkey consumed budget: {t:?}");
+    assert_eq!(
+        (t.banned, t.shed, t.accept),
+        (100, 0, 0),
+        "banned pubkey consumed budget: {t:?}"
+    );
     let t2 = p.tally(5, PK_B, 22587);
-    assert_eq!(t2.accept, 5, "banned pubkey drained the shared budget: {t2:?}");
+    assert_eq!(
+        t2.accept, 5,
+        "banned pubkey drained the shared budget: {t2:?}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -243,9 +318,15 @@ fn shed_events_still_trigger_auto_ban() {
         ("RL_BAN_LIST_FILE", ban_file.to_str().unwrap()),
     ]);
     let t = p.tally(60, PK_A, 22587);
-    assert!(t.banned > 0, "single-source ephemeral flood was never banned: {t:?}");
+    assert!(
+        t.banned > 0,
+        "single-source ephemeral flood was never banned: {t:?}"
+    );
     let persisted = std::fs::read_to_string(&ban_file).unwrap_or_default();
-    assert!(persisted.contains(PK_A), "ban was not persisted: {persisted:?}");
+    assert!(
+        persisted.contains(PK_A),
+        "ban was not persisted: {persisted:?}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -258,9 +339,15 @@ fn blocked_kinds_do_not_drain_budget() {
         ("RL_BLOCK_KINDS", "20001"),
     ]);
     let t = p.tally(100, PK_A, 20001);
-    assert_eq!(t.blocked_kind, 100, "blocked kind was not rejected outright: {t:?}");
+    assert_eq!(
+        t.blocked_kind, 100,
+        "blocked kind was not rejected outright: {t:?}"
+    );
     let t2 = p.tally(5, PK_B, 22587);
-    assert_eq!(t2.accept, 5, "blocked kinds drained the ceiling budget: {t2:?}");
+    assert_eq!(
+        t2.accept, 5,
+        "blocked kinds drained the ceiling budget: {t2:?}"
+    );
 }
 
 /// Both ceilings are off unless configured, so existing deployments are unaffected.
@@ -268,9 +355,17 @@ fn blocked_kinds_do_not_drain_budget() {
 fn ceilings_off_by_default() {
     let mut p = Plugin::start(&[("RL_MAX_EVENTS", "1000000")]);
     let t = p.tally(300, PK_A, 22587);
-    assert_eq!((t.accept, t.shed), (300, 0), "ephemeral ceiling active without config: {t:?}");
+    assert_eq!(
+        (t.accept, t.shed),
+        (300, 0),
+        "ephemeral ceiling active without config: {t:?}"
+    );
     let t2 = p.tally(300, PK_A, 1);
-    assert_eq!((t2.accept, t2.shed), (300, 0), "all-kinds ceiling active without config: {t2:?}");
+    assert_eq!(
+        (t2.accept, t2.shed),
+        (300, 0),
+        "all-kinds ceiling active without config: {t2:?}"
+    );
 }
 
 /// The all-kinds ceiling catches a distributed flood that left the ephemeral range.
@@ -282,7 +377,10 @@ fn total_ceiling_catches_flood_outside_ephemeral_range() {
         ("RL_MAX_EVENTS", "1000000"),
     ]);
     let t = p.tally_distributed(200, 1);
-    assert!(t.shed > 150, "flood outside the ephemeral range was not capped: {t:?}");
+    assert!(
+        t.shed > 150,
+        "flood outside the ephemeral range was not capped: {t:?}"
+    );
     assert!(t.accept <= 12, "let through more than the burst: {t:?}");
 }
 
@@ -297,7 +395,13 @@ fn ephemeral_shed_does_not_charge_total_budget() {
         ("RL_MAX_EVENTS", "1000000"),
     ]);
     let t = p.tally(100, PK_A, 22587);
-    assert!(t.accept <= 3 && t.shed > 90, "ephemeral ceiling misbehaved: {t:?}");
+    assert!(
+        t.accept <= 3 && t.shed > 90,
+        "ephemeral ceiling misbehaved: {t:?}"
+    );
     let t2 = p.tally(15, PK_B, 1);
-    assert!(t2.accept >= 10, "flood drained the all-kinds budget: {t2:?}");
+    assert!(
+        t2.accept >= 10,
+        "flood drained the all-kinds budget: {t2:?}"
+    );
 }
