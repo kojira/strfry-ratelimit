@@ -48,6 +48,12 @@ struct Config {
     /// are trusted forwarders whose copies can race direct delivery of the same events. They
     /// still consume relay-wide ceilings, and the persistent banlist still applies.
     exempt_rate_limit_sources: HashSet<String>,
+    /// Events whose `created_at` is older than this many seconds are not counted against the
+    /// per-pubkey window (0 = off, every event counts). The window measures *arrival* time, so a
+    /// relay/tool re-syncing an author's backlog (negentropy, outbox backfill, a reconnecting
+    /// client flushing its queue) would otherwise ban the author for traffic they did not send.
+    /// Old events still pass the banlist and relay-wide ceilings.
+    count_max_age_seconds: u64,
     /// Relay-wide ceiling on ephemeral events (kinds 20000-29999), in events per second.
     /// 0 disables it. Unlike the per-pubkey limit this is a single global budget, which is what
     /// catches a *distributed* flood: hundreds of pubkeys/IPs each sending a modest rate sum to a
@@ -318,6 +324,7 @@ impl Config {
             block_ephemeral_sources,
             block_source_shadow,
             exempt_rate_limit_sources,
+            count_max_age_seconds: u64_of("count_max_age_seconds", 0),
             ephemeral_rate_per_sec: rate,
             ephemeral_burst: burst,
             total_rate_per_sec: total_rate,
@@ -508,10 +515,10 @@ fn main() {
     let mut source_block_meter = ShedMeter::default();
 
     eprintln!(
-        "strfry-ratelimit: source={} window={}s max={} banOnExceed={} blockSingles={:?} blockRanges={:?} blockEphemeralSources={:?} blockSourceMode={} exemptRateLimitSources={:?} excludeKinds={:?} exempt(eph={},repl={},addr={}) ephemeralCeiling={} totalCeiling={} ceilingMode={} banned_loaded={}",
+        "strfry-ratelimit: source={} window={}s max={} banOnExceed={} blockSingles={:?} blockRanges={:?} blockEphemeralSources={:?} blockSourceMode={} exemptRateLimitSources={:?} countMaxAge={}s excludeKinds={:?} exempt(eph={},repl={},addr={}) ephemeralCeiling={} totalCeiling={} ceilingMode={} banned_loaded={}",
         cfg_path.as_deref().unwrap_or("env"), cfg.window_seconds, cfg.max_events, cfg.ban_on_exceed,
         cfg.block_singles, cfg.block_ranges, cfg.block_ephemeral_sources,
-        if cfg.block_source_shadow { "shadow" } else { "reject" }, cfg.exempt_rate_limit_sources, cfg.exclude_kinds,
+        if cfg.block_source_shadow { "shadow" } else { "reject" }, cfg.exempt_rate_limit_sources, cfg.count_max_age_seconds, cfg.exclude_kinds,
         cfg.exempt_ephemeral, cfg.exempt_replaceable, cfg.exempt_addressable,
         if cfg.ephemeral_rate_per_sec > 0.0 {
             format!("{}/s burst {}", cfg.ephemeral_rate_per_sec, cfg.ephemeral_burst)
@@ -714,7 +721,13 @@ fn main() {
             || (cfg.exempt_ephemeral && is_ephemeral(kind))
             || (cfg.exempt_replaceable && is_replaceable(kind))
             || (cfg.exempt_addressable && is_addressable(kind)));
-        if !subject || cfg.exempts_rate_limit_source(source) {
+        // Backlog/sync traffic: an event authored long before it arrived says nothing about how
+        // fast its author is posting now. Future-dated events are still counted.
+        let stale = cfg.count_max_age_seconds > 0
+            && scan_u64(buf, b"\"created_at\":")
+                .map(|t| t.saturating_add(cfg.count_max_age_seconds) < now_secs())
+                .unwrap_or(false);
+        if !subject || stale || cfg.exempts_rate_limit_source(source) {
             // Exempt from the per-pubkey limiter, but the ceiling still applies. Trusted
             // forwarders are exempted only from attribution/BAN because their copies can race
             // direct delivery; their traffic still consumes the relay's global budget.

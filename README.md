@@ -207,12 +207,21 @@ is ~8× the observed peak while still cutting a 4,000/s flood by 98%. This is a
 last-resort cap on total load, not a spam filter — leave the per-pubkey limiter
 to do the fine-grained work. Off by default.
 
+## Backlog / sync traffic
+
+The per-pubkey window counts events by **arrival** time. When another relay, a negentropy
+sync, or a reconnecting client pushes an author's old events in bulk, the author can exceed
+`max_events` without posting anything and — with `ban_on_exceed` — get banned. Set
+`RL_COUNT_MAX_AGE_SECONDS` (e.g. `600`) to skip events whose `created_at` is older than that
+from the per-pubkey count. They are still checked against the banlist and the relay-wide
+ceilings; future-dated and fresh events are counted as before. Off (`0`) by default.
+
 ## Config file & hot-reload
 
 Set `RL_CONFIG_FILE=/path/to/strfry-ratelimit.conf` to load settings from a file instead of
 environment variables. The file is `key = value` (`#` starts a comment); keys are the env names
 **without** the `RL_` prefix, lowercased — e.g. `window_seconds`, `max_events`, `block_kinds`,
-`block_ephemeral_sources`, `exempt_rate_limit_sources`, `ban_list_file`. See [`examples/strfry-ratelimit.conf`](examples/strfry-ratelimit.conf).
+`block_ephemeral_sources`, `exempt_rate_limit_sources`, `count_max_age_seconds`, `ban_list_file`. See [`examples/strfry-ratelimit.conf`](examples/strfry-ratelimit.conf).
 
 The plugin **re-reads the config file and the banlist when they change (by mtime)**, so you can
 adjust blocked kinds/sources, rate limits, exemptions, and bans/unbans **without restarting strfry**.

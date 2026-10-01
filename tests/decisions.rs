@@ -109,6 +109,19 @@ impl Plugin {
         Self::classify(&self.send_raw_from(id, pubkey, kind, source))
     }
 
+
+    fn send_at(&mut self, id: &str, pubkey: &str, kind: u64, created_at: u64) -> Verdict {
+        writeln!(
+            self.stdin,
+            r#"{{"type":"new","sourceType":"IP4","sourceInfo":"","event":{{"id":"{id}","pubkey":"{pubkey}","kind":{kind},"created_at":{created_at}}}}}"#
+        )
+        .unwrap();
+        self.stdin.flush().unwrap();
+        let mut line = String::new();
+        self.stdout.read_line(&mut line).expect("plugin replied");
+        Self::classify(&line)
+    }
+
     fn tally(&mut self, n: usize, pubkey: &str, kind: u64) -> Tally {
         let mut t = Tally::default();
         for i in 0..n {
@@ -498,4 +511,62 @@ fn ephemeral_shed_does_not_charge_total_budget() {
         t2.accept >= 10,
         "flood drained the all-kinds budget: {t2:?}"
     );
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+#[test]
+fn backlog_sync_of_old_events_does_not_ban_author() {
+    let mut p = Plugin::start(&[
+        ("RL_WINDOW_SECONDS", "60"),
+        ("RL_MAX_EVENTS", "3"),
+        ("RL_BAN_ON_EXCEED", "true"),
+        ("RL_COUNT_MAX_AGE_SECONDS", "600"),
+    ]);
+    let pk = "a".repeat(64);
+    let old = unix_now() - 90 * 86400;
+    for i in 0..50 {
+        assert_eq!(p.send_at(&format!("{i:064x}"), &pk, 1, old), Verdict::Accept);
+    }
+    // Fresh posts are still limited normally.
+    let now = unix_now();
+    let mut v = Vec::new();
+    for i in 100..105 {
+        v.push(p.send_at(&format!("{i:064x}"), &pk, 1, now));
+    }
+    assert_eq!(&v[..3], &[Verdict::Accept; 3]);
+    assert_eq!(v[3], Verdict::Banned);
+}
+
+#[test]
+fn count_max_age_off_by_default_counts_old_events() {
+    let mut p = Plugin::start(&[
+        ("RL_WINDOW_SECONDS", "60"),
+        ("RL_MAX_EVENTS", "3"),
+    ]);
+    let pk = "b".repeat(64);
+    let old = unix_now() - 90 * 86400;
+    let v: Vec<_> = (0..4)
+        .map(|i| p.send_at(&format!("{i:064x}"), &pk, 1, old))
+        .collect();
+    assert_eq!(v[3], Verdict::RateLimited);
+}
+
+#[test]
+fn banned_author_old_events_still_rejected() {
+    let dir = std::env::temp_dir().join(format!("rl-age-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let ban = dir.join("ban.txt");
+    let pk = "c".repeat(64);
+    std::fs::write(&ban, format!("{pk}\n")).unwrap();
+    let mut p = Plugin::start(&[
+        ("RL_BAN_LIST_FILE", ban.to_str().unwrap()),
+        ("RL_COUNT_MAX_AGE_SECONDS", "600"),
+    ]);
+    assert_eq!(p.send_at(&"1".repeat(64), &pk, 1, unix_now() - 86400), Verdict::Banned);
 }
