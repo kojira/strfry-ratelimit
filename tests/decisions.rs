@@ -604,3 +604,60 @@ fn audit_log_records_source_and_verdict() {
     assert_eq!(lines[1][7], "reject");
     assert!(lines[1][8].starts_with("blocked: pubkey is banned"));
 }
+
+impl Plugin {
+    fn send_30078(&mut self, id: &str, pubkey: &str, d: &str, content_len: usize) -> String {
+        let content = "A".repeat(content_len);
+        writeln!(
+            self.stdin,
+            r#"{{"type":"new","sourceType":"IP4","sourceInfo":"198.51.100.1","event":{{"id":"{id}","pubkey":"{pubkey}","kind":30078,"created_at":1,"tags":[["d","{d}"]],"content":"{content}"}}}}"#
+        )
+        .unwrap();
+        self.stdin.flush().unwrap();
+        let mut line = String::new();
+        self.stdout.read_line(&mut line).expect("plugin replied");
+        line
+    }
+}
+
+#[test]
+fn file_chunk_ban_bans_uploader_only_for_large_file_dtags() {
+    let dir = std::env::temp_dir().join(format!("rl-fc-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ban = dir.join("ban.txt");
+    std::fs::write(&ban, "").unwrap();
+    let mut p = Plugin::start(&[
+        ("RL_BAN_LIST_FILE", ban.to_str().unwrap()),
+        ("RL_FILE_CHUNK_ACTION", "ban"),
+    ]);
+    let app = "1".repeat(64);
+    // Normal app data, small file_ tag, and non-matching names are untouched.
+    assert!(p.send_30078(&"a".repeat(64), &app, "nostr_river_flowmeter_12", 40960).contains("\"accept\""));
+    assert!(p.send_30078(&"b".repeat(64), &app, "file_abc_1", 100).contains("\"accept\""));
+    assert!(p.send_30078(&"c".repeat(64), &app, "file_abc_x", 40960).contains("\"accept\""));
+    assert!(p.send_30078(&"d".repeat(64), &app, "myfile_abc_1", 40960).contains("\"accept\""));
+    let up = "2".repeat(64);
+    let r = p.send_30078(&"e".repeat(64), &up, "file_p7yrtkvlm0q_1701", 40960);
+    assert!(r.contains("\"reject\"") && r.contains("banned"), "{r}");
+    assert_eq!(p.send(&"f".repeat(64), &up, 1), Verdict::Banned);
+    drop(p);
+    let saved = std::fs::read_to_string(&ban).unwrap();
+    assert!(saved.contains(&up) && !saved.contains(&app));
+}
+
+#[test]
+fn file_chunk_ignore_shadow_rejects_without_ban() {
+    let mut p = Plugin::start(&[("RL_FILE_CHUNK_ACTION", "ignore")]);
+    let up = "3".repeat(64);
+    let r = p.send_30078(&"a".repeat(64), &up, "file_kc23qmd9huf_0", 40960);
+    assert!(r.contains("\"shadowReject\""), "{r}");
+    assert_eq!(p.send(&"b".repeat(64), &up, 1), Verdict::Accept);
+}
+
+#[test]
+fn file_chunk_off_by_default() {
+    let mut p = Plugin::start(&[]);
+    let r = p.send_30078(&"a".repeat(64), &"4".repeat(64), "file_kc23qmd9huf_0", 40960);
+    assert!(r.contains("\"accept\""), "{r}");
+}

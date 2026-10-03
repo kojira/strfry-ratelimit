@@ -59,6 +59,11 @@ struct Config {
     /// bytes, action, reason. This is what the relay DB cannot answer later: who sent what from
     /// where, including rejected events that were never stored.
     audit_log_dir: Option<String>,
+    /// What to do with chunked file uploads stored as app data (kind 30078 with a d tag of the
+    /// form `file_<id>_<n>` and a large opaque payload): `off`, `ignore` (shadowReject: the
+    /// sender sees OK, nothing is stored) or `ban` (reject and add the pubkey to the banlist).
+    /// Seen 2026-09 as tens of MB of encrypted blobs split into 30 KiB chunks.
+    file_chunk_action: FileChunkAction,
     /// Relay-wide ceiling on ephemeral events (kinds 20000-29999), in events per second.
     /// 0 disables it. Unlike the per-pubkey limit this is a single global budget, which is what
     /// catches a *distributed* flood: hundreds of pubkeys/IPs each sending a modest rate sum to a
@@ -80,6 +85,45 @@ struct Config {
     /// limiter uses the same prefix; Trystero >= 0.25.4 honours it). `true` = `shadowReject`
     /// (sender sees OK, nothing stored) — useful against a source you don't want to tip off.
     ceiling_shadow: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum FileChunkAction {
+    Off,
+    Ignore,
+    Ban,
+}
+
+/// Payload size at or above which a `file_<id>_<n>` kind-30078 event is treated as a file chunk.
+const FILE_CHUNK_MIN_CONTENT: usize = 8192;
+
+/// `file_` + one or more [A-Za-z0-9] + `_` + one or more digits, nothing else.
+fn is_file_chunk_dtag(d: &[u8]) -> bool {
+    let Some(rest) = d.strip_prefix(b"file_") else {
+        return false;
+    };
+    let Some(us) = rest.iter().rposition(|&b| b == b'_') else {
+        return false;
+    };
+    let (name, num) = (&rest[..us], &rest[us + 1..]);
+    !name.is_empty()
+        && name.iter().all(|b| b.is_ascii_alphanumeric())
+        && !num.is_empty()
+        && num.iter().all(|b| b.is_ascii_digit())
+}
+
+/// First `["d","..."]` tag value in the raw request, if any.
+fn scan_dtag(buf: &[u8]) -> &[u8] {
+    let Some(t) = find(buf, b"\"tags\":") else {
+        return b"";
+    };
+    let tail = &buf[t..];
+    let Some(p) = find(tail, b"[\"d\",\"") else {
+        return b"";
+    };
+    let start = p + 6;
+    let end = tail[start..].iter().position(|&b| b == b'"').map(|e| start + e).unwrap_or(start);
+    &tail[start..end]
 }
 
 /// Reason attached to a ceiling `reject`. The `rate-limited:` prefix is load-bearing: it is
@@ -330,6 +374,16 @@ impl Config {
             block_source_shadow,
             exempt_rate_limit_sources,
             count_max_age_seconds: u64_of("count_max_age_seconds", 0),
+            file_chunk_action: match get("file_chunk_action").map(|v| v.trim().to_ascii_lowercase()) {
+                None => FileChunkAction::Off,
+                Some(v) if v.is_empty() || v == "off" => FileChunkAction::Off,
+                Some(v) if v == "ignore" || v == "shadow" => FileChunkAction::Ignore,
+                Some(v) if v == "ban" => FileChunkAction::Ban,
+                Some(v) => {
+                    eprintln!("strfry-ratelimit: ignoring invalid file_chunk_action value {v:?} (want off, ignore or ban)");
+                    FileChunkAction::Off
+                }
+            },
             audit_log_dir: get("audit_log_dir").map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
             ephemeral_rate_per_sec: rate,
             ephemeral_burst: burst,
@@ -604,10 +658,10 @@ fn main() {
     let mut source_block_meter = ShedMeter::default();
 
     eprintln!(
-        "strfry-ratelimit: source={} window={}s max={} banOnExceed={} blockSingles={:?} blockRanges={:?} blockEphemeralSources={:?} blockSourceMode={} exemptRateLimitSources={:?} countMaxAge={}s excludeKinds={:?} exempt(eph={},repl={},addr={}) ephemeralCeiling={} totalCeiling={} ceilingMode={} banned_loaded={}",
+        "strfry-ratelimit: source={} window={}s max={} banOnExceed={} blockSingles={:?} blockRanges={:?} blockEphemeralSources={:?} blockSourceMode={} exemptRateLimitSources={:?} countMaxAge={}s fileChunk={:?} excludeKinds={:?} exempt(eph={},repl={},addr={}) ephemeralCeiling={} totalCeiling={} ceilingMode={} banned_loaded={}",
         cfg_path.as_deref().unwrap_or("env"), cfg.window_seconds, cfg.max_events, cfg.ban_on_exceed,
         cfg.block_singles, cfg.block_ranges, cfg.block_ephemeral_sources,
-        if cfg.block_source_shadow { "shadow" } else { "reject" }, cfg.exempt_rate_limit_sources, cfg.count_max_age_seconds, cfg.exclude_kinds,
+        if cfg.block_source_shadow { "shadow" } else { "reject" }, cfg.exempt_rate_limit_sources, cfg.count_max_age_seconds, cfg.file_chunk_action, cfg.exclude_kinds,
         cfg.exempt_ephemeral, cfg.exempt_replaceable, cfg.exempt_addressable,
         if cfg.ephemeral_rate_per_sec > 0.0 {
             format!("{}/s burst {}", cfg.ephemeral_rate_per_sec, cfg.ephemeral_burst)
@@ -763,6 +817,30 @@ fn main() {
                 respond(&mut out, &mut audit, &cfg.audit_log_dir, &ctx, id, "reject", "blocked: pubkey is banned");
                 continue;
             }
+        }
+
+        // 2a) Chunked file uploads disguised as app data. Checked after the banlist (a banned
+        //     uploader is already rejected) and before the ceilings, so it costs no budget.
+        if cfg.file_chunk_action != FileChunkAction::Off
+            && kind == Some(30078)
+            && is_file_chunk_dtag(scan_dtag(buf))
+            && scan_str(buf, b"\"content\":").len() >= FILE_CHUNK_MIN_CONTENT
+        {
+            match (cfg.file_chunk_action, &pubkey) {
+                (FileChunkAction::Ban, Some(pk)) => {
+                    banned.insert(pk.clone());
+                    buckets.remove(pk);
+                    if let Some(path) = &cfg.ban_list_file {
+                        append_ban(path, pk);
+                    }
+                    eprintln!("strfry-ratelimit: BANNED {pk} (file chunk upload)");
+                    respond(&mut out, &mut audit, &cfg.audit_log_dir, &ctx, id, "reject", "blocked: pubkey is banned (file upload not accepted)");
+                }
+                _ => {
+                    respond(&mut out, &mut audit, &cfg.audit_log_dir, &ctx, id, "shadowReject", "file chunk ignored");
+                }
+            }
+            continue;
         }
 
         // 2b) Relay-wide ceilings. Run AFTER the banlist so an already-banned pubkey cannot

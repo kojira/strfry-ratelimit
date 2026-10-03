@@ -234,6 +234,14 @@ not stored (the relay already has it). Writing is best-effort and never changes 
 `scripts/audit-compact.sh <dir> [days]` gzips finished days and deletes ones older than
 `days` (default 90); run it daily from cron/launchd.
 
+## Chunked file uploads
+
+Some clients upload whole files to relays as kind-30078 app data: the payload is split into
+~30 KiB base64 chunks with d tags `file_<id>_0`, `file_<id>_1`, ... (tens of MB of encrypted
+data per file). `file_chunk_action` handles exactly that shape (`file_<alnum>_<digits>` d tag
+and content >= 8 KiB): `ignore` silently drops the chunk (shadowReject), `ban` rejects it and
+bans the pubkey. Other kind-30078 data is unaffected. Off by default.
+
 ## Config file & hot-reload
 
 Set `RL_CONFIG_FILE=/path/to/strfry-ratelimit.conf` to load settings from a file instead of
