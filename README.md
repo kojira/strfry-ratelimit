@@ -227,7 +227,9 @@ decided event to `<dir>/audit-YYYYMMDD.tsv` (UTC):
 arrival_unix.ms  source_ip  event_id  pubkey  kind  created_at  request_bytes  action  reason
 ```
 
-Rejected events are included, so it also shows who was blocked and why. Event content is
+Rejected events are included, so it also shows who was blocked and why. Ephemeral events
+dropped by `block_ephemeral_sources` are not logged (they are a configured upstream's
+firehose and are already summarized in stderr). Event content is
 not stored (the relay already has it). Writing is best-effort and never changes a verdict.
 `scripts/audit-compact.sh <dir> [days]` gzips finished days and deletes ones older than
 `days` (default 90); run it daily from cron/launchd.

@@ -743,7 +743,9 @@ fn main() {
                         "blocked: ephemeral events from this source are not accepted",
                     )
                 };
-                respond(&mut out, &mut audit, &cfg.audit_log_dir, &ctx, id, action, msg);
+                // Not audited: a configured upstream's ephemeral firehose is high-volume, already
+                // summarized by source_block_meter, and attributes nothing to an end user.
+                respond(&mut out, &mut audit, &None, &ctx, id, action, msg);
                 continue;
             }
         }
