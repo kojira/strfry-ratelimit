@@ -216,6 +216,22 @@ sync, or a reconnecting client pushes an author's old events in bulk, the author
 from the per-pubkey count. They are still checked against the banlist and the relay-wide
 ceilings; future-dated and fresh events are counted as before. Off (`0`) by default.
 
+## Audit trail (who sent what, from where)
+
+strfry's own log records the client IP only on connect, not per stored event, so after the
+fact you cannot tell which IP uploaded a given event. Set `RL_AUDIT_LOG_DIR` (or
+`audit_log_dir` in the config file) to have the plugin append one tab-separated line per
+decided event to `<dir>/audit-YYYYMMDD.tsv` (UTC):
+
+```
+arrival_unix.ms  source_ip  event_id  pubkey  kind  created_at  request_bytes  action  reason
+```
+
+Rejected events are included, so it also shows who was blocked and why. Event content is
+not stored (the relay already has it). Writing is best-effort and never changes a verdict.
+`scripts/audit-compact.sh <dir> [days]` gzips finished days and deletes ones older than
+`days` (default 90); run it daily from cron/launchd.
+
 ## Config file & hot-reload
 
 Set `RL_CONFIG_FILE=/path/to/strfry-ratelimit.conf` to load settings from a file instead of

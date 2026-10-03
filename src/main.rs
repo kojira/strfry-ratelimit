@@ -54,6 +54,11 @@ struct Config {
     /// client flushing its queue) would otherwise ban the author for traffic they did not send.
     /// Old events still pass the banlist and relay-wide ceilings.
     count_max_age_seconds: u64,
+    /// Directory for the per-event audit trail (`audit-YYYYMMDD.tsv`, UTC days). Unset = off.
+    /// One line per decided event: arrival time, source, id, pubkey, kind, created_at, request
+    /// bytes, action, reason. This is what the relay DB cannot answer later: who sent what from
+    /// where, including rejected events that were never stored.
+    audit_log_dir: Option<String>,
     /// Relay-wide ceiling on ephemeral events (kinds 20000-29999), in events per second.
     /// 0 disables it. Unlike the per-pubkey limit this is a single global budget, which is what
     /// catches a *distributed* flood: hundreds of pubkeys/IPs each sending a modest rate sum to a
@@ -325,6 +330,7 @@ impl Config {
             block_source_shadow,
             exempt_rate_limit_sources,
             count_max_age_seconds: u64_of("count_max_age_seconds", 0),
+            audit_log_dir: get("audit_log_dir").map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
             ephemeral_rate_per_sec: rate,
             ephemeral_burst: burst,
             total_rate_per_sec: total_rate,
@@ -464,9 +470,91 @@ fn append_ban(path: &str, pubkey: &str) {
     }
 }
 
-/// Write one response line. `id` is 64-char hex and `action`/`msg` are fixed ASCII literals, so no
-/// JSON string escaping is needed.
-fn respond(out: &mut impl Write, id: &[u8], action: &str, msg: &str) {
+/// Per-event facts for the audit trail, filled in as the request is parsed.
+#[derive(Default)]
+struct Ctx {
+    source: String,
+    pubkey: String,
+    kind: String,
+    created_at: String,
+    bytes: usize,
+}
+
+/// Civil date (UTC) for a unix day number. Howard Hinnant's days_from_civil inverse.
+fn ymd(days: i64) -> (i64, u32, u32) {
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Append-only daily audit file. Failures are reported once per day and never affect verdicts.
+#[derive(Default)]
+struct Audit {
+    dir: Option<String>,
+    day: i64,
+    file: Option<std::fs::File>,
+    warned_day: i64,
+}
+
+impl Audit {
+    fn write(&mut self, dir: &Option<String>, id: &[u8], action: &str, msg: &str, c: &Ctx) {
+        let Some(d) = dir else {
+            self.file = None;
+            self.dir = None;
+            return;
+        };
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+        let day = (now.as_secs() / 86400) as i64;
+        if self.file.is_none() || self.day != day || self.dir.as_deref() != Some(d.as_str()) {
+            let (y, m, dd) = ymd(day);
+            let path = format!("{d}/audit-{y:04}{m:02}{dd:02}.tsv");
+            self.file = OpenOptions::new().create(true).append(true).open(&path).ok();
+            self.day = day;
+            self.dir = Some(d.clone());
+            if self.file.is_none() && self.warned_day != day {
+                self.warned_day = day;
+                eprintln!("strfry-ratelimit: audit log {path} not writable");
+            }
+        }
+        if let Some(f) = &mut self.file {
+            let clean = |s: &str| s.replace(['\t', '\n', '\r'], " ");
+            let line = format!(
+                "{}.{:03}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                now.as_secs(),
+                now.subsec_millis(),
+                clean(&c.source),
+                clean(std::str::from_utf8(id).unwrap_or("")),
+                clean(&c.pubkey),
+                c.kind,
+                c.created_at,
+                c.bytes,
+                action,
+                msg
+            );
+            let _ = f.write_all(line.as_bytes());
+        }
+    }
+}
+
+/// Write one response line (and its audit record). `id` is 64-char hex and `action`/`msg` are
+/// fixed ASCII literals, so no JSON string escaping is needed.
+#[allow(clippy::too_many_arguments)]
+fn respond(
+    out: &mut impl Write,
+    audit: &mut Audit,
+    dir: &Option<String>,
+    ctx: &Ctx,
+    id: &[u8],
+    action: &str,
+    msg: &str,
+) {
     let _ = out.write_all(b"{\"id\":\"");
     let _ = out.write_all(id);
     let _ = out.write_all(b"\",\"action\":\"");
@@ -475,6 +563,7 @@ fn respond(out: &mut impl Write, id: &[u8], action: &str, msg: &str) {
     let _ = out.write_all(msg.as_bytes());
     let _ = out.write_all(b"\"}\n");
     let _ = out.flush();
+    audit.write(dir, id, action, msg, ctx);
 }
 
 fn main() {
@@ -540,6 +629,7 @@ fn main() {
     let mut out = io::BufWriter::new(stdout.lock());
     let mut line: Vec<u8> = Vec::with_capacity(8192);
     let mut processed: u64 = 0;
+    let mut audit = Audit::default();
     let mut tick: u64 = 0;
 
     loop {
@@ -610,18 +700,31 @@ fn main() {
         if let Some(p) = find(buf, b"\"type\":") {
             let i = skip_ws(buf, p + 7);
             if buf.get(i..i + 5) != Some(b"\"new\"") {
-                respond(&mut out, id, "accept", "");
+                respond(&mut out, &mut audit, &cfg.audit_log_dir, &Ctx::default(), id, "accept", "");
                 continue;
             }
         }
 
         let kind = scan_u64(buf, b"\"kind\":");
         let source = std::str::from_utf8(scan_str(buf, b"\"sourceInfo\":")).unwrap_or("");
+        let ctx = if cfg.audit_log_dir.is_some() {
+            Ctx {
+                source: source.to_string(),
+                pubkey: String::from_utf8_lossy(scan_str(buf, b"\"pubkey\":")).into_owned(),
+                kind: kind.map(|k| k.to_string()).unwrap_or_default(),
+                created_at: scan_u64(buf, b"\"created_at\":")
+                    .map(|t| t.to_string())
+                    .unwrap_or_default(),
+                bytes: buf.len(),
+            }
+        } else {
+            Ctx::default()
+        };
 
         // 1) Kind blocklist — cheap, drops floods outright before we extract pubkey or touch state.
         if let Some(k) = kind {
             if cfg.is_blocked(k) {
-                respond(&mut out, id, "reject", "blocked: kind not accepted here");
+                respond(&mut out, &mut audit, &cfg.audit_log_dir, &ctx, id, "reject", "blocked: kind not accepted here");
                 continue;
             }
         }
@@ -640,7 +743,7 @@ fn main() {
                         "blocked: ephemeral events from this source are not accepted",
                     )
                 };
-                respond(&mut out, id, action, msg);
+                respond(&mut out, &mut audit, &cfg.audit_log_dir, &ctx, id, action, msg);
                 continue;
             }
         }
@@ -655,7 +758,7 @@ fn main() {
         //    malformed kind/pubkey field.
         if let Some(pk) = &pubkey {
             if !banned.is_empty() && banned.contains(pk) {
-                respond(&mut out, id, "reject", "blocked: pubkey is banned");
+                respond(&mut out, &mut audit, &cfg.audit_log_dir, &ctx, id, "reject", "blocked: pubkey is banned");
                 continue;
             }
         }
@@ -710,7 +813,7 @@ fn main() {
                     } else {
                         ("accept", "")
                     };
-                    respond(&mut out, id, action, msg);
+                    respond(&mut out, &mut audit, &cfg.audit_log_dir, &ctx, id, action, msg);
                 }
                 continue;
             }
@@ -737,7 +840,7 @@ fn main() {
                 } else {
                     ("accept", "")
                 };
-                respond(&mut out, id, action, msg);
+                respond(&mut out, &mut audit, &cfg.audit_log_dir, &ctx, id, action, msg);
             }
             continue;
         }
@@ -769,7 +872,7 @@ fn main() {
                 } else {
                     ("accept", "")
                 };
-                respond(&mut out, id, action, msg);
+                respond(&mut out, &mut audit, &cfg.audit_log_dir, &ctx, id, action, msg);
                 continue;
             }
         }
@@ -794,15 +897,21 @@ fn main() {
                 eprintln!("strfry-ratelimit: BANNED {pubkey} (exceeded rate limit)");
                 respond(
                     &mut out,
+                    &mut audit,
+                    &cfg.audit_log_dir,
+                    &ctx,
                     id,
                     "reject",
                     "blocked: pubkey is banned (rate limit exceeded)",
                 );
             } else if cfg.mode_shadow {
-                respond(&mut out, id, "shadowReject", "");
+                respond(&mut out, &mut audit, &cfg.audit_log_dir, &ctx, id, "shadowReject", "");
             } else {
                 respond(
                     &mut out,
+                    &mut audit,
+                    &cfg.audit_log_dir,
+                    &ctx,
                     id,
                     "reject",
                     "rate-limited: too many events, slow down",
@@ -827,7 +936,7 @@ fn main() {
             } else {
                 ("accept", "")
             };
-            respond(&mut out, id, action, msg);
+            respond(&mut out, &mut audit, &cfg.audit_log_dir, &ctx, id, action, msg);
         }
 
         // Periodically evict expired/empty buckets to bound memory.

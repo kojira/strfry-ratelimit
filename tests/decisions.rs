@@ -570,3 +570,37 @@ fn banned_author_old_events_still_rejected() {
     ]);
     assert_eq!(p.send_at(&"1".repeat(64), &pk, 1, unix_now() - 86400), Verdict::Banned);
 }
+
+#[test]
+fn audit_log_records_source_and_verdict() {
+    let dir = std::env::temp_dir().join(format!("rl-audit-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ban = dir.join("ban.txt");
+    let bad = "d".repeat(64);
+    std::fs::write(&ban, format!("{bad}\n")).unwrap();
+    let mut p = Plugin::start(&[
+        ("RL_AUDIT_LOG_DIR", dir.to_str().unwrap()),
+        ("RL_BAN_LIST_FILE", ban.to_str().unwrap()),
+    ]);
+    assert_eq!(p.send_from(&"1".repeat(64), &"e".repeat(64), 1, "203.0.113.7"), Verdict::Accept);
+    assert_eq!(p.send_from(&"2".repeat(64), &bad, 1, "2001:db8::9"), Verdict::Banned);
+    drop(p);
+    let files: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with("audit-"))
+        .collect();
+    assert_eq!(files.len(), 1);
+    let text = std::fs::read_to_string(files[0].path()).unwrap();
+    let lines: Vec<Vec<&str>> = text.lines().map(|l| l.split('\t').collect()).collect();
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0][1], "203.0.113.7");
+    assert_eq!(lines[0][2], "1".repeat(64));
+    assert_eq!(lines[0][3], "e".repeat(64));
+    assert_eq!(lines[0][4], "1");
+    assert_eq!(lines[0][7], "accept");
+    assert_eq!(lines[1][1], "2001:db8::9");
+    assert_eq!(lines[1][7], "reject");
+    assert!(lines[1][8].starts_with("blocked: pubkey is banned"));
+}
