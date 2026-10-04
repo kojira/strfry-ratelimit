@@ -661,3 +661,110 @@ fn file_chunk_off_by_default() {
     let r = p.send_30078(&"a".repeat(64), &"4".repeat(64), "file_kc23qmd9huf_0", 40960);
     assert!(r.contains("\"accept\""), "{r}");
 }
+
+#[test]
+fn source_limit_bans_key_rotating_sender_and_all_its_kinds() {
+    let dir = std::env::temp_dir().join(format!("rl-srcban-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let ban = dir.join("banned-sources.txt");
+    let _ = std::fs::remove_file(&ban);
+    let mut p = Plugin::start(&[
+        ("RL_MAX_EVENTS", "1000"),
+        ("RL_WINDOW_SECONDS", "180"),
+        ("RL_SOURCE_WINDOW_SECONDS", "600"),
+        ("RL_SOURCE_MAX_EVENTS", "5"),
+        ("RL_SOURCE_BAN_ON_EXCEED", "true"),
+        ("RL_SOURCE_BAN_LIST_FILE", ban.to_str().unwrap()),
+        ("RL_EXEMPT_RATE_LIMIT_SOURCES", "149.28.29.200"),
+    ]);
+    // Five fresh pubkeys within one IPv6 /64 (different interface IDs) are all accepted...
+    for i in 0..5 {
+        let src = format!("240d:1a:574:a900::{:x}", i + 1);
+        assert_eq!(p.send_from(&format!("{i:064x}"), &format!("{:064x}", 100 + i), 1, &src), Verdict::Accept);
+    }
+    // ...the sixth, with yet another new key, bans the /64.
+    let line = p.send_raw_from(&format!("{:064x}", 5), &format!("{:064x}", 200), 1, "240d:1a:574:a900:9506:b091:9ce1:d13e");
+    assert!(line.contains("blocked: source is banned"), "{line}");
+    // Now every kind from that /64 is rejected, including exempt ones (ephemeral, reaction).
+    for (i, k) in [20000u64, 7, 0].iter().enumerate() {
+        let line = p.send_raw_from(&format!("{:064x}", 10 + i), &format!("{:064x}", 300 + i), *k, "240d:1a:574:a900::99");
+        assert!(line.contains("blocked: source is banned"), "kind {k}: {line}");
+    }
+    // Other addresses, a different /64 and the exempt forwarder are unaffected.
+    assert_eq!(p.send_from(&format!("{:064x}", 20), PK_A, 1, "240d:1a:574:a901::1"), Verdict::Accept);
+    assert_eq!(p.send_from(&format!("{:064x}", 21), PK_A, 1, "203.0.113.5"), Verdict::Accept);
+    assert_eq!(p.send_from(&format!("{:064x}", 22), PK_B, 1, "149.28.29.200"), Verdict::Accept);
+    // Persisted as the /64.
+    assert_eq!(std::fs::read_to_string(&ban).unwrap().trim(), "240d:1a:574:a900::/64");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn source_limit_counts_only_subject_events_and_skips_exempt_forwarder() {
+    let mut p = Plugin::start(&[
+        ("RL_MAX_EVENTS", "1000"),
+        ("RL_SOURCE_WINDOW_SECONDS", "600"),
+        ("RL_SOURCE_MAX_EVENTS", "3"),
+        ("RL_SOURCE_BAN_ON_EXCEED", "true"),
+        ("RL_EXEMPT_RATE_LIMIT_SOURCES", "149.28.29.200"),
+    ]);
+    // Ephemeral, reactions and replaceable events do not count toward the source window.
+    for (i, k) in [20000u64, 20001, 7, 0, 3, 10002, 20000, 7].iter().enumerate() {
+        assert_eq!(p.send_from(&format!("{i:064x}"), PK_A, *k, "198.51.100.7"), Verdict::Accept);
+    }
+    // A trusted forwarder is never source-limited.
+    for i in 0..10 {
+        assert_eq!(p.send_from(&format!("{:064x}", 100 + i), PK_B, 1, "149.28.29.200"), Verdict::Accept);
+    }
+    // Three counted events pass, the fourth exceeds.
+    for i in 0..3 {
+        assert_eq!(p.send_from(&format!("{:064x}", 200 + i), PK_A, 1, "198.51.100.7"), Verdict::Accept);
+    }
+    let line = p.send_raw_from(&format!("{:064x}", 300), PK_A, 1, "198.51.100.7");
+    assert!(line.contains("blocked: source is banned"), "{line}");
+}
+
+#[test]
+fn source_limit_without_ban_only_rate_limits() {
+    let mut p = Plugin::start(&[
+        ("RL_MAX_EVENTS", "1000"),
+        ("RL_SOURCE_WINDOW_SECONDS", "600"),
+        ("RL_SOURCE_MAX_EVENTS", "2"),
+    ]);
+    for i in 0..2 {
+        assert_eq!(p.send_from(&format!("{i:064x}"), PK_A, 1, "198.51.100.8"), Verdict::Accept);
+    }
+    assert_eq!(p.send_from(&format!("{:064x}", 2), PK_B, 1, "198.51.100.8"), Verdict::RateLimited);
+    // Not banned: an exempt kind from the same address still passes.
+    assert_eq!(p.send_from(&format!("{:064x}", 3), PK_B, 20000, "198.51.100.8"), Verdict::Accept);
+}
+
+#[test]
+fn source_limit_off_by_default() {
+    let mut p = Plugin::start(&[("RL_MAX_EVENTS", "1000")]);
+    for i in 0..50 {
+        assert_eq!(p.send_from(&format!("{i:064x}"), &format!("{:064x}", i + 1), 1, "198.51.100.9"), Verdict::Accept);
+    }
+}
+
+#[test]
+fn source_banlist_file_is_loaded_and_hot_unbanned() {
+    let dir = std::env::temp_dir().join(format!("rl-srcload-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let ban = dir.join("banned-sources.txt");
+    std::fs::write(&ban, "# comment\n240d:1a:574:a900::/64\n192.0.2.1\n").unwrap();
+    let mut p = Plugin::start(&[("RL_SOURCE_BAN_LIST_FILE", ban.to_str().unwrap())]);
+    let l = p.send_raw_from(&format!("{:064x}", 1), PK_A, 1, "240d:1a:574:a900:1234::5");
+    assert!(l.contains("blocked: source is banned"), "{l}");
+    let l = p.send_raw_from(&format!("{:064x}", 2), PK_A, 1, "192.0.2.1");
+    assert!(l.contains("blocked: source is banned"), "{l}");
+    assert_eq!(p.send_from(&format!("{:064x}", 3), PK_A, 1, "192.0.2.2"), Verdict::Accept);
+    // Unban by removing the line; reload is mtime-driven and checked every 64 events.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    std::fs::write(&ban, "192.0.2.1\n").unwrap();
+    for i in 0..70 {
+        p.send_raw_from(&format!("{:064x}", 100 + i), PK_B, 1, "203.0.113.77");
+    }
+    assert_eq!(p.send_from(&format!("{:064x}", 9), PK_A, 1, "240d:1a:574:a900:1234::5"), Verdict::Accept);
+    let _ = std::fs::remove_dir_all(&dir);
+}

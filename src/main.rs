@@ -85,6 +85,21 @@ struct Config {
     /// limiter uses the same prefix; Trystero >= 0.25.4 honours it). `true` = `shadowReject`
     /// (sender sees OK, nothing stored) — useful against a source you don't want to tip off.
     ceiling_shadow: bool,
+    /// Per-source sliding window (seconds), 0 = off. A source is the connecting address from
+    /// `sourceInfo`: an IPv4 address, or the /64 of an IPv6 address. Non-IP sources (stream/sync
+    /// upstream URLs) and `exempt_rate_limit_sources` are never counted. It counts the same events as
+    /// the per-pubkey window, summed over every pubkey from that source. This catches a sender that
+    /// rotates throwaway keys to stay under the per-pubkey limit.
+    source_window_seconds: u64,
+    /// Events allowed per source within `source_window_seconds`.
+    source_max_events: u64,
+    /// `true`: a source that exceeds the limit is banned. All of its events, every kind and every
+    /// pubkey, are rejected until the line is removed from `source_ban_list_file`. `false`: excess
+    /// events are rejected with `rate-limited:` and the source is not banned.
+    source_ban_on_exceed: bool,
+    /// Persisted source bans (one IPv4 or IPv6 address/prefix per line; IPv6 is stored and
+    /// matched as /64). Hot-reloaded on mtime change, so deleting a line unbans.
+    source_ban_list_file: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -390,6 +405,12 @@ impl Config {
             total_rate_per_sec: total_rate,
             total_burst,
             ceiling_shadow,
+            source_window_seconds: u64_of("source_window_seconds", 0),
+            source_max_events: u64_of("source_max_events", 0),
+            source_ban_on_exceed: bool_of("source_ban_on_exceed", false),
+            source_ban_list_file: get("source_ban_list_file")
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
         }
     }
     /// Config from environment variables: generic key `foo_bar` reads env `RL_FOO_BAR`.
@@ -514,6 +535,36 @@ fn load_banlist(path: &str) -> HashSet<String> {
         }
     }
     set
+}
+/// Rate-limit/ban key for a `sourceInfo` value: the IPv4 address itself, or `a:b:c:d::/64` for
+/// IPv6 (one subscriber line usually owns a whole /64 and can rotate within it). A trailing
+/// `/len` is ignored, so a banlist line may be written as an address or as a prefix. `None` for
+/// anything that is not an IP (e.g. an upstream relay URL from stream/sync).
+fn source_key(source: &str) -> Option<String> {
+    let addr = source.trim().split('/').next().unwrap_or("");
+    let addr = addr.trim_start_matches('[').trim_end_matches(']');
+    match addr.parse::<std::net::IpAddr>().ok()? {
+        std::net::IpAddr::V4(v4) => Some(v4.to_string()),
+        std::net::IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return Some(v4.to_string());
+            }
+            let s = v6.segments();
+            Some(format!("{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3]))
+        }
+    }
+}
+fn load_source_banlist(path: &str) -> HashSet<String> {
+    std::fs::read_to_string(path)
+        .map(|content| {
+            content
+                .lines()
+                .map(|l| strip_comment(l).trim())
+                .filter(|l| !l.is_empty())
+                .filter_map(source_key)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 fn append_ban(path: &str, pubkey: &str) {
     match OpenOptions::new().create(true).append(true).open(path) {
@@ -644,6 +695,13 @@ fn main() {
     let mut ban_mtime = ban_path.as_deref().and_then(mtime);
 
     let mut buckets: HashMap<String, VecDeque<u64>> = HashMap::new();
+    let mut source_buckets: HashMap<String, VecDeque<u64>> = HashMap::new();
+    let mut source_ban_path = cfg.source_ban_list_file.clone();
+    let mut banned_sources: HashSet<String> = source_ban_path
+        .as_deref()
+        .map(load_source_banlist)
+        .unwrap_or_default();
+    let mut source_ban_mtime = source_ban_path.as_deref().and_then(mtime);
     // Event IDs that this plugin accepted recently. strfry's Ingester checks the DB before
     // writePolicy, but two sources can both pass that check before Writer commits either copy.
     // Remembering accepted IDs prevents that race from charging one logical event twice.
@@ -657,6 +715,17 @@ fn main() {
     let mut total_meter = ShedMeter::default();
     let mut source_block_meter = ShedMeter::default();
 
+    eprintln!(
+        "strfry-ratelimit: sourceLimit={} sourceBanOnExceed={} sourceBanList={:?} banned_sources_loaded={}",
+        if cfg.source_window_seconds > 0 && cfg.source_max_events > 0 {
+            format!("{}/{}s", cfg.source_max_events, cfg.source_window_seconds)
+        } else {
+            "off".to_string()
+        },
+        cfg.source_ban_on_exceed,
+        cfg.source_ban_list_file,
+        banned_sources.len()
+    );
     eprintln!(
         "strfry-ratelimit: source={} window={}s max={} banOnExceed={} blockSingles={:?} blockRanges={:?} blockEphemeralSources={:?} blockSourceMode={} exemptRateLimitSources={:?} countMaxAge={}s fileChunk={:?} excludeKinds={:?} exempt(eph={},repl={},addr={}) ephemeralCeiling={} totalCeiling={} ceilingMode={} banned_loaded={}",
         cfg_path.as_deref().unwrap_or("env"), cfg.window_seconds, cfg.max_events, cfg.ban_on_exceed,
@@ -713,6 +782,14 @@ fn main() {
                             banned = ban_path.as_deref().map(load_banlist).unwrap_or_default();
                             ban_mtime = ban_path.as_deref().and_then(mtime);
                         }
+                        if cfg.source_ban_list_file != source_ban_path {
+                            source_ban_path = cfg.source_ban_list_file.clone();
+                            banned_sources = source_ban_path
+                                .as_deref()
+                                .map(load_source_banlist)
+                                .unwrap_or_default();
+                            source_ban_mtime = source_ban_path.as_deref().and_then(mtime);
+                        }
                         eprintln!(
                             "strfry-ratelimit: reloaded config from {p} (blockEphemeralSources={:?} blockSourceMode={} exemptRateLimitSources={:?} ephemeralCeiling={} totalCeiling={} ceilingMode={})",
                             cfg.block_ephemeral_sources,
@@ -739,6 +816,13 @@ fn main() {
                 if m.is_some() && m != ban_mtime {
                     banned = load_banlist(p);
                     ban_mtime = m;
+                }
+            }
+            if let Some(p) = &source_ban_path {
+                let m = mtime(p);
+                if m.is_some() && m != source_ban_mtime {
+                    banned_sources = load_source_banlist(p);
+                    source_ban_mtime = m;
                 }
             }
         }
@@ -779,6 +863,20 @@ fn main() {
         if let Some(k) = kind {
             if cfg.is_blocked(k) {
                 respond(&mut out, &mut audit, &cfg.audit_log_dir, &ctx, id, "reject", "blocked: kind not accepted here");
+                continue;
+            }
+        }
+
+        // 1a) Banned source (connecting address): every kind, every pubkey. Checked before the
+        //     ceilings so a banned sender cannot drain the shared budget.
+        let src_key = if cfg.exempts_rate_limit_source(source) {
+            None
+        } else {
+            source_key(source)
+        };
+        if let Some(sk) = &src_key {
+            if !banned_sources.is_empty() && banned_sources.contains(sk) {
+                respond(&mut out, &mut audit, &cfg.audit_log_dir, &ctx, id, "reject", "blocked: source is banned");
                 continue;
             }
         }
@@ -957,6 +1055,37 @@ fn main() {
             }
         }
 
+        // 5a) Per-source sliding window: the same events summed over every pubkey from one
+        //     address, so rotating throwaway keys does not reset the count.
+        if let (Some(sk), true) = (
+            &src_key,
+            cfg.source_window_seconds > 0 && cfg.source_max_events > 0,
+        ) {
+            let sb = source_buckets.entry(sk.clone()).or_default();
+            while let Some(&front) = sb.front() {
+                if front + cfg.source_window_seconds <= now {
+                    sb.pop_front();
+                } else {
+                    break;
+                }
+            }
+            if sb.len() as u64 >= cfg.source_max_events {
+                if cfg.source_ban_on_exceed {
+                    banned_sources.insert(sk.clone());
+                    source_buckets.remove(sk);
+                    if let Some(path) = &cfg.source_ban_list_file {
+                        append_ban(path, sk);
+                    }
+                    eprintln!("strfry-ratelimit: BANNED SOURCE {sk} (exceeded per-source rate limit; last pubkey {pubkey})");
+                    respond(&mut out, &mut audit, &cfg.audit_log_dir, &ctx, id, "reject", "blocked: source is banned (rate limit exceeded)");
+                } else {
+                    respond(&mut out, &mut audit, &cfg.audit_log_dir, &ctx, id, "reject", "rate-limited: too many events from this address, slow down");
+                }
+                continue;
+            }
+            sb.push_back(now);
+        }
+
         // 5) Sliding-window rate limit.
         let bucket = buckets.entry(pubkey.clone()).or_default();
         while let Some(&front) = bucket.front() {
@@ -1027,6 +1156,16 @@ fn main() {
             buckets.retain(|_, b| {
                 while let Some(&front) = b.front() {
                     if front + cfg.window_seconds <= now {
+                        b.pop_front();
+                    } else {
+                        break;
+                    }
+                }
+                !b.is_empty()
+            });
+            source_buckets.retain(|_, b| {
+                while let Some(&front) = b.front() {
+                    if front + cfg.source_window_seconds <= now {
                         b.pop_front();
                     } else {
                         break;
