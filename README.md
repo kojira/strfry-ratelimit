@@ -253,6 +253,10 @@ grouped by /64.
 - `source_ban_on_exceed = true`: an address that goes over is banned. Every kind from every pubkey at
   that address is then rejected (`blocked: source is banned`). With `false`, extra events
   are only rate-limited.
+- `source_count_addressable` (default `false`): addressable kinds (30000-39999) are not counted
+  toward the source window even when `exempt_addressable = false`. Apps that sync state as
+  addressable events (e.g. kind 30079) write fast from shared home lines, and a source ban takes
+  out every user on that line. Set `true` to count them.
 - `source_ban_list_file`: persisted source bans, one address or IPv6 /64 per line, hot-reloaded.
   To unban, delete the line.
 
