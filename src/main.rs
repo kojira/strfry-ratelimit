@@ -100,6 +100,10 @@ struct Config {
     /// Persisted source bans (one IPv4 or IPv6 address/prefix per line; IPv6 is stored and
     /// matched as /64). Hot-reloaded on mtime change, so deleting a line unbans.
     source_ban_list_file: Option<String>,
+    /// Count addressable kinds (30000-39999) toward the per-source window. Default false: app
+    /// state streams (e.g. kind 30079 world-state) are written fast by legitimate apps and
+    /// replace themselves, so counting them banned whole home lines (2026-10-07).
+    source_count_addressable: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -408,6 +412,7 @@ impl Config {
             source_window_seconds: u64_of("source_window_seconds", 0),
             source_max_events: u64_of("source_max_events", 0),
             source_ban_on_exceed: bool_of("source_ban_on_exceed", false),
+            source_count_addressable: bool_of("source_count_addressable", false),
             source_ban_list_file: get("source_ban_list_file")
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty()),
@@ -1059,7 +1064,9 @@ fn main() {
         //     address, so rotating throwaway keys does not reset the count.
         if let (Some(sk), true) = (
             &src_key,
-            cfg.source_window_seconds > 0 && cfg.source_max_events > 0,
+            cfg.source_window_seconds > 0
+                && cfg.source_max_events > 0
+                && (cfg.source_count_addressable || !is_addressable(kind)),
         ) {
             let sb = source_buckets.entry(sk.clone()).or_default();
             while let Some(&front) = sb.front() {

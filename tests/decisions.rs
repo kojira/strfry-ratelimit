@@ -725,6 +725,41 @@ fn source_limit_counts_only_subject_events_and_skips_exempt_forwarder() {
 }
 
 #[test]
+fn source_limit_ignores_addressable_app_state_by_default() {
+    // 2026-10-07: a kind-30079 world-state app wrote >300/10min from shared home lines and the
+    // source ban took out every user on those lines. Addressable kinds are not counted by default.
+    let mut p = Plugin::start(&[
+        ("RL_MAX_EVENTS", "1000"),
+        ("RL_EXEMPT_ADDRESSABLE", "false"),
+        ("RL_SOURCE_WINDOW_SECONDS", "600"),
+        ("RL_SOURCE_MAX_EVENTS", "3"),
+        ("RL_SOURCE_BAN_ON_EXCEED", "true"),
+    ]);
+    for i in 0..20 {
+        assert_eq!(p.send_from(&format!("{i:064x}"), PK_A, 30079, "2405:1204:4094:4a00::1"), Verdict::Accept);
+    }
+    // Ordinary posts from the same /64 are still subject to the source limit.
+    for i in 0..3 {
+        assert_eq!(p.send_from(&format!("{:064x}", 100 + i), PK_B, 1, "2405:1204:4094:4a00::2"), Verdict::Accept);
+    }
+    let line = p.send_raw_from(&format!("{:064x}", 200), PK_B, 1, "2405:1204:4094:4a00::2");
+    assert!(line.contains("blocked: source is banned"), "{line}");
+
+    // Opt back in with source_count_addressable = true.
+    let mut q = Plugin::start(&[
+        ("RL_MAX_EVENTS", "1000"),
+        ("RL_EXEMPT_ADDRESSABLE", "false"),
+        ("RL_SOURCE_WINDOW_SECONDS", "600"),
+        ("RL_SOURCE_MAX_EVENTS", "3"),
+        ("RL_SOURCE_COUNT_ADDRESSABLE", "true"),
+    ]);
+    for i in 0..3 {
+        assert_eq!(q.send_from(&format!("{i:064x}"), PK_A, 30079, "198.51.100.20"), Verdict::Accept);
+    }
+    assert_eq!(q.send_from(&format!("{:064x}", 3), PK_A, 30079, "198.51.100.20"), Verdict::RateLimited);
+}
+
+#[test]
 fn source_limit_without_ban_only_rate_limits() {
     let mut p = Plugin::start(&[
         ("RL_MAX_EVENTS", "1000"),
