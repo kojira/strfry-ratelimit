@@ -242,6 +242,19 @@ data per file). `file_chunk_action` handles exactly that shape (`file_<alnum>_<d
 and content >= 8 KiB): `ignore` silently drops the chunk (shadowReject), `ban` rejects it and
 bans the pubkey. Other kind-30078 data is unaffected. Off by default.
 
+## Build-time source publishing (`block_build_publish`)
+
+gnostr-org/get_file_hash publishes every git-tracked file as a kind 1 during `cargo build
+--release --features nostr`, including in GitHub Actions on every push, to ~300 relays. Keys
+rotate per commit/file and CI spreads it over cloud addresses, so the per-pubkey and per-source
+limits do not see it. `block_build_publish = true` rejects it by shape and never bans:
+
+- kind 1 whose tags start with `["file",..]` and include `["version",..]`, or start with `["build_manifest",..]`
+- kind 0 containing `Metadata for file event: `
+- NIP-34 kinds (1617-1621, 30617, 30618) with `d` = `test-repo-for-*` or clone `git@example.com:test/*`
+
+The reason contains `spam not permitted`, which that tool reads as "drop this relay for the rest of the build". Off by default.
+
 ## Per-source limit (key rotation)
 
 A sender that mints a fresh pubkey every few minutes never reaches the per-pubkey limit. The

@@ -104,6 +104,13 @@ struct Config {
     /// state streams (e.g. kind 30079 world-state) are written fast by legitimate apps and
     /// replace themselves, so counting them banned whole home lines (2026-10-07).
     source_count_addressable: bool,
+    /// Reject the build-time publishing of gnostr-org/get_file_hash and its forks/CI runs
+    /// (2026-10-09): every git-tracked file as a kind 1 with `["file",..],["version",..]` tags,
+    /// a kind 0 per file ("Metadata for file event: ..."), a kind-1 build manifest, and NIP-34
+    /// test fixtures (`test-repo-for-*`, `git@example.com:test/*`). Keys rotate per commit/file
+    /// and CI spreads it over cloud IPs, so neither per-pubkey nor per-source limits see it.
+    /// Matched by shape, never banned. Default false.
+    block_build_publish: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -129,6 +136,26 @@ fn is_file_chunk_dtag(d: &[u8]) -> bool {
         && name.iter().all(|b| b.is_ascii_alphanumeric())
         && !num.is_empty()
         && num.iter().all(|b| b.is_ascii_digit())
+}
+
+/// Shape of gnostr get_file_hash build-time publishing (see `block_build_publish`).
+/// The reason text contains "spam not permitted", which that tool treats as "drop this relay
+/// for the rest of the build".
+const BUILD_PUBLISH_MSG: &str = "blocked: spam not permitted (source files / build artifacts as notes)";
+
+fn is_build_publish(kind: Option<u64>, buf: &[u8]) -> bool {
+    let tags = find(buf, b"\"tags\":").map(|t| skip_ws(buf, t + 7)).map(|i| &buf[i..]).unwrap_or(b"");
+    match kind {
+        Some(1) => {
+            (tags.starts_with(b"[[\"file\",\"") && find(tags, b"[\"version\",\"").is_some())
+                || tags.starts_with(b"[[\"build_manifest\",\"")
+        }
+        Some(0) => find(buf, b"Metadata for file event: ").is_some(),
+        Some(1617..=1621) | Some(30617) | Some(30618) => {
+            find(tags, b"[\"d\",\"test-repo-for-").is_some() || find(tags, b"\"git@example.com:test/").is_some()
+        }
+        _ => false,
+    }
 }
 
 /// First `["d","..."]` tag value in the raw request, if any.
@@ -413,6 +440,7 @@ impl Config {
             source_max_events: u64_of("source_max_events", 0),
             source_ban_on_exceed: bool_of("source_ban_on_exceed", false),
             source_count_addressable: bool_of("source_count_addressable", false),
+            block_build_publish: bool_of("block_build_publish", false),
             source_ban_list_file: get("source_ban_list_file")
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty()),
@@ -732,10 +760,10 @@ fn main() {
         banned_sources.len()
     );
     eprintln!(
-        "strfry-ratelimit: source={} window={}s max={} banOnExceed={} blockSingles={:?} blockRanges={:?} blockEphemeralSources={:?} blockSourceMode={} exemptRateLimitSources={:?} countMaxAge={}s fileChunk={:?} excludeKinds={:?} exempt(eph={},repl={},addr={}) ephemeralCeiling={} totalCeiling={} ceilingMode={} banned_loaded={}",
+        "strfry-ratelimit: source={} window={}s max={} banOnExceed={} blockSingles={:?} blockRanges={:?} blockEphemeralSources={:?} blockSourceMode={} exemptRateLimitSources={:?} countMaxAge={}s fileChunk={:?} buildPublish={} excludeKinds={:?} exempt(eph={},repl={},addr={}) ephemeralCeiling={} totalCeiling={} ceilingMode={} banned_loaded={}",
         cfg_path.as_deref().unwrap_or("env"), cfg.window_seconds, cfg.max_events, cfg.ban_on_exceed,
         cfg.block_singles, cfg.block_ranges, cfg.block_ephemeral_sources,
-        if cfg.block_source_shadow { "shadow" } else { "reject" }, cfg.exempt_rate_limit_sources, cfg.count_max_age_seconds, cfg.file_chunk_action, cfg.exclude_kinds,
+        if cfg.block_source_shadow { "shadow" } else { "reject" }, cfg.exempt_rate_limit_sources, cfg.count_max_age_seconds, cfg.file_chunk_action, cfg.block_build_publish, cfg.exclude_kinds,
         cfg.exempt_ephemeral, cfg.exempt_replaceable, cfg.exempt_addressable,
         if cfg.ephemeral_rate_per_sec > 0.0 {
             format!("{}/s burst {}", cfg.ephemeral_rate_per_sec, cfg.ephemeral_burst)
@@ -943,6 +971,13 @@ fn main() {
                     respond(&mut out, &mut audit, &cfg.audit_log_dir, &ctx, id, "shadowReject", "file chunk ignored");
                 }
             }
+            continue;
+        }
+
+        // 2a') Build-time source publishing (gnostr get_file_hash). Rejected, never banned: keys
+        //      and CI addresses rotate, and a ban would only hit whoever gets the address next.
+        if cfg.block_build_publish && is_build_publish(kind, buf) {
+            respond(&mut out, &mut audit, &cfg.audit_log_dir, &ctx, id, "reject", BUILD_PUBLISH_MSG);
             continue;
         }
 

@@ -803,3 +803,54 @@ fn source_banlist_file_is_loaded_and_hot_unbanned() {
     assert_eq!(p.send_from(&format!("{:064x}", 9), PK_A, 1, "240d:1a:574:a900:1234::5"), Verdict::Accept);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+impl Plugin {
+    fn send_event_json(&mut self, id: &str, kind: u64, tags: &str, content: &str) -> String {
+        writeln!(
+            self.stdin,
+            r#"{{"type":"new","sourceType":"IP4","sourceInfo":"20.169.60.129","event":{{"content":"{content}","created_at":1791499451,"id":"{id}","kind":{kind},"pubkey":"{pk}","sig":"00","tags":{tags}}}}}"#,
+            pk = PK_A
+        )
+        .unwrap();
+        self.stdin.flush().unwrap();
+        let mut line = String::new();
+        self.stdout.read_line(&mut line).expect("plugin replied");
+        line
+    }
+}
+
+#[test]
+fn build_publish_shapes_are_rejected_without_banning() {
+    let mut p = Plugin::start(&[("RL_BLOCK_BUILD_PUBLISH", "true")]);
+    let rejected = [
+        (1, r#"[["file","src/bin/readme.rs"],["version","0.4.7"]]"#, "fn main() {}"),
+        (1, r#"[["build_manifest","0.5.0"],["build_manifest","0.5.0"],["e","aa"]]"#, "Build manifest for get_file_hash v0.5.0"),
+        (0, "[]", r#"{\"name\":\"build.rs\",\"about\":\"Metadata for file event: build.rs\"}"#),
+        (1618, r#"[["d","test-repo-for-pr"],["commit","0123"],["clone","git@example.com:test/pr-branch.git"]]"#, "gnostr patch"),
+        (30618, r#"[["d","test-repo-for-state"],["name","x"],["commit","y"]]"#, ""),
+    ];
+    for (i, (k, tags, content)) in rejected.iter().enumerate() {
+        let line = p.send_event_json(&format!("{:064x}", i + 1), *k, tags, content);
+        assert!(line.contains("\"action\":\"reject\"") && line.contains("spam not permitted"), "kind {k}: {line}");
+    }
+    let accepted = [
+        (1, r#"[["t","file"],["version","1"]]"#, "a note about a file"),
+        (1, r#"[["e","aa"],["file","x"]]"#, "reply"),
+        (0, "[]", r#"{\"name\":\"alice\",\"about\":\"hi\"}"#),
+        (30617, r#"[["d","my-repo"],["clone","https://github.com/a/b.git"]]"#, ""),
+        (1621, r#"[["a","30617:aa:my-repo"]]"#, "real issue"),
+    ];
+    for (i, (k, tags, content)) in accepted.iter().enumerate() {
+        let line = p.send_event_json(&format!("{:064x}", 100 + i), *k, tags, content);
+        assert!(line.contains("\"action\":\"accept\""), "kind {k}: {line}");
+    }
+    // Not banned: an ordinary note from the same pubkey/source still goes through.
+    assert_eq!(p.send_from(&format!("{:064x}", 200), PK_A, 1, "20.169.60.129"), Verdict::Accept);
+}
+
+#[test]
+fn build_publish_off_by_default() {
+    let mut p = Plugin::start(&[]);
+    let line = p.send_event_json(&format!("{:064x}", 1), 1, r#"[["file","a.rs"],["version","1"]]"#, "x");
+    assert!(line.contains("\"action\":\"accept\""), "{line}");
+}
