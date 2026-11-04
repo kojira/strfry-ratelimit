@@ -242,12 +242,47 @@ data per file). `file_chunk_action` handles exactly that shape (`file_<alnum>_<d
 and content >= 8 KiB): `ignore` silently drops the chunk (shadowReject), `ban` rejects it and
 bans the pubkey. Other kind-30078 data is unaffected. Off by default.
 
+## Build-time source publishing (`block_build_publish`)
+
+gnostr-org/get_file_hash publishes every git-tracked file as a kind 1 during `cargo build
+--release --features nostr`, including in GitHub Actions on every push, to ~300 relays. Keys
+rotate per commit/file and CI spreads it over cloud addresses, so the per-pubkey and per-source
+limits do not see it. `block_build_publish = true` rejects it by shape and never bans:
+
+- kind 1 whose tags start with `["file",..]` and include `["version",..]`, or start with `["build_manifest",..]`
+- kind 0 containing `Metadata for file event: `
+- NIP-34 kinds (1617-1621, 30617, 30618) with `d` = `test-repo-for-*` or clone `git@example.com:test/*`
+
+The reason contains `spam not permitted`, which that tool reads as "drop this relay for the rest of the build". Off by default.
+
+## Per-source limit (key rotation)
+
+A sender that mints a fresh pubkey every few minutes never reaches the per-pubkey limit. The
+per-source window counts the same events (the same exempt kinds and stale rule apply), summed
+over every pubkey from one connecting address. An IPv4 address counts on its own. IPv6 is
+grouped by /64.
+
+- `source_window_seconds` / `source_max_events`: the window. Both 0 (off) by default.
+- `source_ban_on_exceed = true`: an address that goes over is banned. Every kind from every pubkey at
+  that address is then rejected (`blocked: source is banned`). With `false`, extra events
+  are only rate-limited.
+- `source_count_addressable` (default `false`): addressable kinds (30000-39999) are not counted
+  toward the source window even when `exempt_addressable = false`. Apps that sync state as
+  addressable events (e.g. kind 30079) write fast from shared home lines, and a source ban takes
+  out every user on that line. Set `true` to count them.
+- `source_ban_list_file`: persisted source bans, one address or IPv6 /64 per line, hot-reloaded.
+  To unban, delete the line.
+
+`sourceInfo` must be the real client address. Behind a proxy, set strfry's `realIpHeader`.
+Addresses in `exempt_rate_limit_sources` are never counted or banned. Non-IP sources (stream/sync
+upstream URLs) are also never counted or banned.
+
 ## Config file & hot-reload
 
 Set `RL_CONFIG_FILE=/path/to/strfry-ratelimit.conf` to load settings from a file instead of
 environment variables. The file is `key = value` (`#` starts a comment); keys are the env names
 **without** the `RL_` prefix, lowercased — e.g. `window_seconds`, `max_events`, `block_kinds`,
-`block_ephemeral_sources`, `exempt_rate_limit_sources`, `count_max_age_seconds`, `ban_list_file`. See [`examples/strfry-ratelimit.conf`](examples/strfry-ratelimit.conf).
+`block_ephemeral_sources`, `exempt_rate_limit_sources`, `count_max_age_seconds`, `ban_list_file`, `source_max_events`. See [`examples/strfry-ratelimit.conf`](examples/strfry-ratelimit.conf).
 
 The plugin **re-reads the config file and the banlist when they change (by mtime)**, so you can
 adjust blocked kinds/sources, rate limits, exemptions, and bans/unbans **without restarting strfry**.
