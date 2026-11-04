@@ -109,6 +109,19 @@ impl Plugin {
         Self::classify(&self.send_raw_from(id, pubkey, kind, source))
     }
 
+
+    fn send_at(&mut self, id: &str, pubkey: &str, kind: u64, created_at: u64) -> Verdict {
+        writeln!(
+            self.stdin,
+            r#"{{"type":"new","sourceType":"IP4","sourceInfo":"","event":{{"id":"{id}","pubkey":"{pubkey}","kind":{kind},"created_at":{created_at}}}}}"#
+        )
+        .unwrap();
+        self.stdin.flush().unwrap();
+        let mut line = String::new();
+        self.stdout.read_line(&mut line).expect("plugin replied");
+        Self::classify(&line)
+    }
+
     fn tally(&mut self, n: usize, pubkey: &str, kind: u64) -> Tally {
         let mut t = Tally::default();
         for i in 0..n {
@@ -498,4 +511,153 @@ fn ephemeral_shed_does_not_charge_total_budget() {
         t2.accept >= 10,
         "flood drained the all-kinds budget: {t2:?}"
     );
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+#[test]
+fn backlog_sync_of_old_events_does_not_ban_author() {
+    let mut p = Plugin::start(&[
+        ("RL_WINDOW_SECONDS", "60"),
+        ("RL_MAX_EVENTS", "3"),
+        ("RL_BAN_ON_EXCEED", "true"),
+        ("RL_COUNT_MAX_AGE_SECONDS", "600"),
+    ]);
+    let pk = "a".repeat(64);
+    let old = unix_now() - 90 * 86400;
+    for i in 0..50 {
+        assert_eq!(p.send_at(&format!("{i:064x}"), &pk, 1, old), Verdict::Accept);
+    }
+    // Fresh posts are still limited normally.
+    let now = unix_now();
+    let mut v = Vec::new();
+    for i in 100..105 {
+        v.push(p.send_at(&format!("{i:064x}"), &pk, 1, now));
+    }
+    assert_eq!(&v[..3], &[Verdict::Accept; 3]);
+    assert_eq!(v[3], Verdict::Banned);
+}
+
+#[test]
+fn count_max_age_off_by_default_counts_old_events() {
+    let mut p = Plugin::start(&[
+        ("RL_WINDOW_SECONDS", "60"),
+        ("RL_MAX_EVENTS", "3"),
+    ]);
+    let pk = "b".repeat(64);
+    let old = unix_now() - 90 * 86400;
+    let v: Vec<_> = (0..4)
+        .map(|i| p.send_at(&format!("{i:064x}"), &pk, 1, old))
+        .collect();
+    assert_eq!(v[3], Verdict::RateLimited);
+}
+
+#[test]
+fn banned_author_old_events_still_rejected() {
+    let dir = std::env::temp_dir().join(format!("rl-age-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let ban = dir.join("ban.txt");
+    let pk = "c".repeat(64);
+    std::fs::write(&ban, format!("{pk}\n")).unwrap();
+    let mut p = Plugin::start(&[
+        ("RL_BAN_LIST_FILE", ban.to_str().unwrap()),
+        ("RL_COUNT_MAX_AGE_SECONDS", "600"),
+    ]);
+    assert_eq!(p.send_at(&"1".repeat(64), &pk, 1, unix_now() - 86400), Verdict::Banned);
+}
+
+#[test]
+fn audit_log_records_source_and_verdict() {
+    let dir = std::env::temp_dir().join(format!("rl-audit-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ban = dir.join("ban.txt");
+    let bad = "d".repeat(64);
+    std::fs::write(&ban, format!("{bad}\n")).unwrap();
+    let mut p = Plugin::start(&[
+        ("RL_AUDIT_LOG_DIR", dir.to_str().unwrap()),
+        ("RL_BAN_LIST_FILE", ban.to_str().unwrap()),
+    ]);
+    assert_eq!(p.send_from(&"1".repeat(64), &"e".repeat(64), 1, "203.0.113.7"), Verdict::Accept);
+    assert_eq!(p.send_from(&"2".repeat(64), &bad, 1, "2001:db8::9"), Verdict::Banned);
+    drop(p);
+    let files: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with("audit-"))
+        .collect();
+    assert_eq!(files.len(), 1);
+    let text = std::fs::read_to_string(files[0].path()).unwrap();
+    let lines: Vec<Vec<&str>> = text.lines().map(|l| l.split('\t').collect()).collect();
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0][1], "203.0.113.7");
+    assert_eq!(lines[0][2], "1".repeat(64));
+    assert_eq!(lines[0][3], "e".repeat(64));
+    assert_eq!(lines[0][4], "1");
+    assert_eq!(lines[0][7], "accept");
+    assert_eq!(lines[1][1], "2001:db8::9");
+    assert_eq!(lines[1][7], "reject");
+    assert!(lines[1][8].starts_with("blocked: pubkey is banned"));
+}
+
+impl Plugin {
+    fn send_30078(&mut self, id: &str, pubkey: &str, d: &str, content_len: usize) -> String {
+        let content = "A".repeat(content_len);
+        writeln!(
+            self.stdin,
+            r#"{{"type":"new","sourceType":"IP4","sourceInfo":"198.51.100.1","event":{{"id":"{id}","pubkey":"{pubkey}","kind":30078,"created_at":1,"tags":[["d","{d}"]],"content":"{content}"}}}}"#
+        )
+        .unwrap();
+        self.stdin.flush().unwrap();
+        let mut line = String::new();
+        self.stdout.read_line(&mut line).expect("plugin replied");
+        line
+    }
+}
+
+#[test]
+fn file_chunk_ban_bans_uploader_only_for_large_file_dtags() {
+    let dir = std::env::temp_dir().join(format!("rl-fc-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ban = dir.join("ban.txt");
+    std::fs::write(&ban, "").unwrap();
+    let mut p = Plugin::start(&[
+        ("RL_BAN_LIST_FILE", ban.to_str().unwrap()),
+        ("RL_FILE_CHUNK_ACTION", "ban"),
+    ]);
+    let app = "1".repeat(64);
+    // Normal app data, small file_ tag, and non-matching names are untouched.
+    assert!(p.send_30078(&"a".repeat(64), &app, "nostr_river_flowmeter_12", 40960).contains("\"accept\""));
+    assert!(p.send_30078(&"b".repeat(64), &app, "file_abc_1", 100).contains("\"accept\""));
+    assert!(p.send_30078(&"c".repeat(64), &app, "file_abc_x", 40960).contains("\"accept\""));
+    assert!(p.send_30078(&"d".repeat(64), &app, "myfile_abc_1", 40960).contains("\"accept\""));
+    let up = "2".repeat(64);
+    let r = p.send_30078(&"e".repeat(64), &up, "file_p7yrtkvlm0q_1701", 40960);
+    assert!(r.contains("\"reject\"") && r.contains("banned"), "{r}");
+    assert_eq!(p.send(&"f".repeat(64), &up, 1), Verdict::Banned);
+    drop(p);
+    let saved = std::fs::read_to_string(&ban).unwrap();
+    assert!(saved.contains(&up) && !saved.contains(&app));
+}
+
+#[test]
+fn file_chunk_ignore_shadow_rejects_without_ban() {
+    let mut p = Plugin::start(&[("RL_FILE_CHUNK_ACTION", "ignore")]);
+    let up = "3".repeat(64);
+    let r = p.send_30078(&"a".repeat(64), &up, "file_kc23qmd9huf_0", 40960);
+    assert!(r.contains("\"shadowReject\""), "{r}");
+    assert_eq!(p.send(&"b".repeat(64), &up, 1), Verdict::Accept);
+}
+
+#[test]
+fn file_chunk_off_by_default() {
+    let mut p = Plugin::start(&[]);
+    let r = p.send_30078(&"a".repeat(64), &"4".repeat(64), "file_kc23qmd9huf_0", 40960);
+    assert!(r.contains("\"accept\""), "{r}");
 }

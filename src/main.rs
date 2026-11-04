@@ -48,6 +48,22 @@ struct Config {
     /// are trusted forwarders whose copies can race direct delivery of the same events. They
     /// still consume relay-wide ceilings, and the persistent banlist still applies.
     exempt_rate_limit_sources: HashSet<String>,
+    /// Events whose `created_at` is older than this many seconds are not counted against the
+    /// per-pubkey window (0 = off, every event counts). The window measures *arrival* time, so a
+    /// relay/tool re-syncing an author's backlog (negentropy, outbox backfill, a reconnecting
+    /// client flushing its queue) would otherwise ban the author for traffic they did not send.
+    /// Old events still pass the banlist and relay-wide ceilings.
+    count_max_age_seconds: u64,
+    /// Directory for the per-event audit trail (`audit-YYYYMMDD.tsv`, UTC days). Unset = off.
+    /// One line per decided event: arrival time, source, id, pubkey, kind, created_at, request
+    /// bytes, action, reason. This is what the relay DB cannot answer later: who sent what from
+    /// where, including rejected events that were never stored.
+    audit_log_dir: Option<String>,
+    /// What to do with chunked file uploads stored as app data (kind 30078 with a d tag of the
+    /// form `file_<id>_<n>` and a large opaque payload): `off`, `ignore` (shadowReject: the
+    /// sender sees OK, nothing is stored) or `ban` (reject and add the pubkey to the banlist).
+    /// Seen 2026-09 as tens of MB of encrypted blobs split into 30 KiB chunks.
+    file_chunk_action: FileChunkAction,
     /// Relay-wide ceiling on ephemeral events (kinds 20000-29999), in events per second.
     /// 0 disables it. Unlike the per-pubkey limit this is a single global budget, which is what
     /// catches a *distributed* flood: hundreds of pubkeys/IPs each sending a modest rate sum to a
@@ -69,6 +85,45 @@ struct Config {
     /// limiter uses the same prefix; Trystero >= 0.25.4 honours it). `true` = `shadowReject`
     /// (sender sees OK, nothing stored) — useful against a source you don't want to tip off.
     ceiling_shadow: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum FileChunkAction {
+    Off,
+    Ignore,
+    Ban,
+}
+
+/// Payload size at or above which a `file_<id>_<n>` kind-30078 event is treated as a file chunk.
+const FILE_CHUNK_MIN_CONTENT: usize = 8192;
+
+/// `file_` + one or more [A-Za-z0-9] + `_` + one or more digits, nothing else.
+fn is_file_chunk_dtag(d: &[u8]) -> bool {
+    let Some(rest) = d.strip_prefix(b"file_") else {
+        return false;
+    };
+    let Some(us) = rest.iter().rposition(|&b| b == b'_') else {
+        return false;
+    };
+    let (name, num) = (&rest[..us], &rest[us + 1..]);
+    !name.is_empty()
+        && name.iter().all(|b| b.is_ascii_alphanumeric())
+        && !num.is_empty()
+        && num.iter().all(|b| b.is_ascii_digit())
+}
+
+/// First `["d","..."]` tag value in the raw request, if any.
+fn scan_dtag(buf: &[u8]) -> &[u8] {
+    let Some(t) = find(buf, b"\"tags\":") else {
+        return b"";
+    };
+    let tail = &buf[t..];
+    let Some(p) = find(tail, b"[\"d\",\"") else {
+        return b"";
+    };
+    let start = p + 6;
+    let end = tail[start..].iter().position(|&b| b == b'"').map(|e| start + e).unwrap_or(start);
+    &tail[start..end]
 }
 
 /// Reason attached to a ceiling `reject`. The `rate-limited:` prefix is load-bearing: it is
@@ -318,6 +373,18 @@ impl Config {
             block_ephemeral_sources,
             block_source_shadow,
             exempt_rate_limit_sources,
+            count_max_age_seconds: u64_of("count_max_age_seconds", 0),
+            file_chunk_action: match get("file_chunk_action").map(|v| v.trim().to_ascii_lowercase()) {
+                None => FileChunkAction::Off,
+                Some(v) if v.is_empty() || v == "off" => FileChunkAction::Off,
+                Some(v) if v == "ignore" || v == "shadow" => FileChunkAction::Ignore,
+                Some(v) if v == "ban" => FileChunkAction::Ban,
+                Some(v) => {
+                    eprintln!("strfry-ratelimit: ignoring invalid file_chunk_action value {v:?} (want off, ignore or ban)");
+                    FileChunkAction::Off
+                }
+            },
+            audit_log_dir: get("audit_log_dir").map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
             ephemeral_rate_per_sec: rate,
             ephemeral_burst: burst,
             total_rate_per_sec: total_rate,
@@ -457,9 +524,91 @@ fn append_ban(path: &str, pubkey: &str) {
     }
 }
 
-/// Write one response line. `id` is 64-char hex and `action`/`msg` are fixed ASCII literals, so no
-/// JSON string escaping is needed.
-fn respond(out: &mut impl Write, id: &[u8], action: &str, msg: &str) {
+/// Per-event facts for the audit trail, filled in as the request is parsed.
+#[derive(Default)]
+struct Ctx {
+    source: String,
+    pubkey: String,
+    kind: String,
+    created_at: String,
+    bytes: usize,
+}
+
+/// Civil date (UTC) for a unix day number. Howard Hinnant's days_from_civil inverse.
+fn ymd(days: i64) -> (i64, u32, u32) {
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Append-only daily audit file. Failures are reported once per day and never affect verdicts.
+#[derive(Default)]
+struct Audit {
+    dir: Option<String>,
+    day: i64,
+    file: Option<std::fs::File>,
+    warned_day: i64,
+}
+
+impl Audit {
+    fn write(&mut self, dir: &Option<String>, id: &[u8], action: &str, msg: &str, c: &Ctx) {
+        let Some(d) = dir else {
+            self.file = None;
+            self.dir = None;
+            return;
+        };
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+        let day = (now.as_secs() / 86400) as i64;
+        if self.file.is_none() || self.day != day || self.dir.as_deref() != Some(d.as_str()) {
+            let (y, m, dd) = ymd(day);
+            let path = format!("{d}/audit-{y:04}{m:02}{dd:02}.tsv");
+            self.file = OpenOptions::new().create(true).append(true).open(&path).ok();
+            self.day = day;
+            self.dir = Some(d.clone());
+            if self.file.is_none() && self.warned_day != day {
+                self.warned_day = day;
+                eprintln!("strfry-ratelimit: audit log {path} not writable");
+            }
+        }
+        if let Some(f) = &mut self.file {
+            let clean = |s: &str| s.replace(['\t', '\n', '\r'], " ");
+            let line = format!(
+                "{}.{:03}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                now.as_secs(),
+                now.subsec_millis(),
+                clean(&c.source),
+                clean(std::str::from_utf8(id).unwrap_or("")),
+                clean(&c.pubkey),
+                c.kind,
+                c.created_at,
+                c.bytes,
+                action,
+                msg
+            );
+            let _ = f.write_all(line.as_bytes());
+        }
+    }
+}
+
+/// Write one response line (and its audit record). `id` is 64-char hex and `action`/`msg` are
+/// fixed ASCII literals, so no JSON string escaping is needed.
+#[allow(clippy::too_many_arguments)]
+fn respond(
+    out: &mut impl Write,
+    audit: &mut Audit,
+    dir: &Option<String>,
+    ctx: &Ctx,
+    id: &[u8],
+    action: &str,
+    msg: &str,
+) {
     let _ = out.write_all(b"{\"id\":\"");
     let _ = out.write_all(id);
     let _ = out.write_all(b"\",\"action\":\"");
@@ -468,6 +617,7 @@ fn respond(out: &mut impl Write, id: &[u8], action: &str, msg: &str) {
     let _ = out.write_all(msg.as_bytes());
     let _ = out.write_all(b"\"}\n");
     let _ = out.flush();
+    audit.write(dir, id, action, msg, ctx);
 }
 
 fn main() {
@@ -508,10 +658,10 @@ fn main() {
     let mut source_block_meter = ShedMeter::default();
 
     eprintln!(
-        "strfry-ratelimit: source={} window={}s max={} banOnExceed={} blockSingles={:?} blockRanges={:?} blockEphemeralSources={:?} blockSourceMode={} exemptRateLimitSources={:?} excludeKinds={:?} exempt(eph={},repl={},addr={}) ephemeralCeiling={} totalCeiling={} ceilingMode={} banned_loaded={}",
+        "strfry-ratelimit: source={} window={}s max={} banOnExceed={} blockSingles={:?} blockRanges={:?} blockEphemeralSources={:?} blockSourceMode={} exemptRateLimitSources={:?} countMaxAge={}s fileChunk={:?} excludeKinds={:?} exempt(eph={},repl={},addr={}) ephemeralCeiling={} totalCeiling={} ceilingMode={} banned_loaded={}",
         cfg_path.as_deref().unwrap_or("env"), cfg.window_seconds, cfg.max_events, cfg.ban_on_exceed,
         cfg.block_singles, cfg.block_ranges, cfg.block_ephemeral_sources,
-        if cfg.block_source_shadow { "shadow" } else { "reject" }, cfg.exempt_rate_limit_sources, cfg.exclude_kinds,
+        if cfg.block_source_shadow { "shadow" } else { "reject" }, cfg.exempt_rate_limit_sources, cfg.count_max_age_seconds, cfg.file_chunk_action, cfg.exclude_kinds,
         cfg.exempt_ephemeral, cfg.exempt_replaceable, cfg.exempt_addressable,
         if cfg.ephemeral_rate_per_sec > 0.0 {
             format!("{}/s burst {}", cfg.ephemeral_rate_per_sec, cfg.ephemeral_burst)
@@ -533,6 +683,7 @@ fn main() {
     let mut out = io::BufWriter::new(stdout.lock());
     let mut line: Vec<u8> = Vec::with_capacity(8192);
     let mut processed: u64 = 0;
+    let mut audit = Audit::default();
     let mut tick: u64 = 0;
 
     loop {
@@ -603,18 +754,31 @@ fn main() {
         if let Some(p) = find(buf, b"\"type\":") {
             let i = skip_ws(buf, p + 7);
             if buf.get(i..i + 5) != Some(b"\"new\"") {
-                respond(&mut out, id, "accept", "");
+                respond(&mut out, &mut audit, &cfg.audit_log_dir, &Ctx::default(), id, "accept", "");
                 continue;
             }
         }
 
         let kind = scan_u64(buf, b"\"kind\":");
         let source = std::str::from_utf8(scan_str(buf, b"\"sourceInfo\":")).unwrap_or("");
+        let ctx = if cfg.audit_log_dir.is_some() {
+            Ctx {
+                source: source.to_string(),
+                pubkey: String::from_utf8_lossy(scan_str(buf, b"\"pubkey\":")).into_owned(),
+                kind: kind.map(|k| k.to_string()).unwrap_or_default(),
+                created_at: scan_u64(buf, b"\"created_at\":")
+                    .map(|t| t.to_string())
+                    .unwrap_or_default(),
+                bytes: buf.len(),
+            }
+        } else {
+            Ctx::default()
+        };
 
         // 1) Kind blocklist — cheap, drops floods outright before we extract pubkey or touch state.
         if let Some(k) = kind {
             if cfg.is_blocked(k) {
-                respond(&mut out, id, "reject", "blocked: kind not accepted here");
+                respond(&mut out, &mut audit, &cfg.audit_log_dir, &ctx, id, "reject", "blocked: kind not accepted here");
                 continue;
             }
         }
@@ -633,7 +797,9 @@ fn main() {
                         "blocked: ephemeral events from this source are not accepted",
                     )
                 };
-                respond(&mut out, id, action, msg);
+                // Not audited: a configured upstream's ephemeral firehose is high-volume, already
+                // summarized by source_block_meter, and attributes nothing to an end user.
+                respond(&mut out, &mut audit, &None, &ctx, id, action, msg);
                 continue;
             }
         }
@@ -648,9 +814,33 @@ fn main() {
         //    malformed kind/pubkey field.
         if let Some(pk) = &pubkey {
             if !banned.is_empty() && banned.contains(pk) {
-                respond(&mut out, id, "reject", "blocked: pubkey is banned");
+                respond(&mut out, &mut audit, &cfg.audit_log_dir, &ctx, id, "reject", "blocked: pubkey is banned");
                 continue;
             }
+        }
+
+        // 2a) Chunked file uploads disguised as app data. Checked after the banlist (a banned
+        //     uploader is already rejected) and before the ceilings, so it costs no budget.
+        if cfg.file_chunk_action != FileChunkAction::Off
+            && kind == Some(30078)
+            && is_file_chunk_dtag(scan_dtag(buf))
+            && scan_str(buf, b"\"content\":").len() >= FILE_CHUNK_MIN_CONTENT
+        {
+            match (cfg.file_chunk_action, &pubkey) {
+                (FileChunkAction::Ban, Some(pk)) => {
+                    banned.insert(pk.clone());
+                    buckets.remove(pk);
+                    if let Some(path) = &cfg.ban_list_file {
+                        append_ban(path, pk);
+                    }
+                    eprintln!("strfry-ratelimit: BANNED {pk} (file chunk upload)");
+                    respond(&mut out, &mut audit, &cfg.audit_log_dir, &ctx, id, "reject", "blocked: pubkey is banned (file upload not accepted)");
+                }
+                _ => {
+                    respond(&mut out, &mut audit, &cfg.audit_log_dir, &ctx, id, "shadowReject", "file chunk ignored");
+                }
+            }
+            continue;
         }
 
         // 2b) Relay-wide ceilings. Run AFTER the banlist so an already-banned pubkey cannot
@@ -703,7 +893,7 @@ fn main() {
                     } else {
                         ("accept", "")
                     };
-                    respond(&mut out, id, action, msg);
+                    respond(&mut out, &mut audit, &cfg.audit_log_dir, &ctx, id, action, msg);
                 }
                 continue;
             }
@@ -714,7 +904,13 @@ fn main() {
             || (cfg.exempt_ephemeral && is_ephemeral(kind))
             || (cfg.exempt_replaceable && is_replaceable(kind))
             || (cfg.exempt_addressable && is_addressable(kind)));
-        if !subject || cfg.exempts_rate_limit_source(source) {
+        // Backlog/sync traffic: an event authored long before it arrived says nothing about how
+        // fast its author is posting now. Future-dated events are still counted.
+        let stale = cfg.count_max_age_seconds > 0
+            && scan_u64(buf, b"\"created_at\":")
+                .map(|t| t.saturating_add(cfg.count_max_age_seconds) < now_secs())
+                .unwrap_or(false);
+        if !subject || stale || cfg.exempts_rate_limit_source(source) {
             // Exempt from the per-pubkey limiter, but the ceiling still applies. Trusted
             // forwarders are exempted only from attribution/BAN because their copies can race
             // direct delivery; their traffic still consumes the relay's global budget.
@@ -724,7 +920,7 @@ fn main() {
                 } else {
                     ("accept", "")
                 };
-                respond(&mut out, id, action, msg);
+                respond(&mut out, &mut audit, &cfg.audit_log_dir, &ctx, id, action, msg);
             }
             continue;
         }
@@ -756,7 +952,7 @@ fn main() {
                 } else {
                     ("accept", "")
                 };
-                respond(&mut out, id, action, msg);
+                respond(&mut out, &mut audit, &cfg.audit_log_dir, &ctx, id, action, msg);
                 continue;
             }
         }
@@ -781,15 +977,21 @@ fn main() {
                 eprintln!("strfry-ratelimit: BANNED {pubkey} (exceeded rate limit)");
                 respond(
                     &mut out,
+                    &mut audit,
+                    &cfg.audit_log_dir,
+                    &ctx,
                     id,
                     "reject",
                     "blocked: pubkey is banned (rate limit exceeded)",
                 );
             } else if cfg.mode_shadow {
-                respond(&mut out, id, "shadowReject", "");
+                respond(&mut out, &mut audit, &cfg.audit_log_dir, &ctx, id, "shadowReject", "");
             } else {
                 respond(
                     &mut out,
+                    &mut audit,
+                    &cfg.audit_log_dir,
+                    &ctx,
                     id,
                     "reject",
                     "rate-limited: too many events, slow down",
@@ -814,7 +1016,7 @@ fn main() {
             } else {
                 ("accept", "")
             };
-            respond(&mut out, id, action, msg);
+            respond(&mut out, &mut audit, &cfg.audit_log_dir, &ctx, id, action, msg);
         }
 
         // Periodically evict expired/empty buckets to bound memory.

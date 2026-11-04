@@ -207,12 +207,47 @@ is ~8× the observed peak while still cutting a 4,000/s flood by 98%. This is a
 last-resort cap on total load, not a spam filter — leave the per-pubkey limiter
 to do the fine-grained work. Off by default.
 
+## Backlog / sync traffic
+
+The per-pubkey window counts events by **arrival** time. When another relay, a negentropy
+sync, or a reconnecting client pushes an author's old events in bulk, the author can exceed
+`max_events` without posting anything and — with `ban_on_exceed` — get banned. Set
+`RL_COUNT_MAX_AGE_SECONDS` (e.g. `600`) to skip events whose `created_at` is older than that
+from the per-pubkey count. They are still checked against the banlist and the relay-wide
+ceilings; future-dated and fresh events are counted as before. Off (`0`) by default.
+
+## Audit trail (who sent what, from where)
+
+strfry's own log records the client IP only on connect, not per stored event, so after the
+fact you cannot tell which IP uploaded a given event. Set `RL_AUDIT_LOG_DIR` (or
+`audit_log_dir` in the config file) to have the plugin append one tab-separated line per
+decided event to `<dir>/audit-YYYYMMDD.tsv` (UTC):
+
+```
+arrival_unix.ms  source_ip  event_id  pubkey  kind  created_at  request_bytes  action  reason
+```
+
+Rejected events are included, so it also shows who was blocked and why. Ephemeral events
+dropped by `block_ephemeral_sources` are not logged (they are a configured upstream's
+firehose and are already summarized in stderr). Event content is
+not stored (the relay already has it). Writing is best-effort and never changes a verdict.
+`scripts/audit-compact.sh <dir> [days]` gzips finished days and deletes ones older than
+`days` (default 90); run it daily from cron/launchd.
+
+## Chunked file uploads
+
+Some clients upload whole files to relays as kind-30078 app data: the payload is split into
+~30 KiB base64 chunks with d tags `file_<id>_0`, `file_<id>_1`, ... (tens of MB of encrypted
+data per file). `file_chunk_action` handles exactly that shape (`file_<alnum>_<digits>` d tag
+and content >= 8 KiB): `ignore` silently drops the chunk (shadowReject), `ban` rejects it and
+bans the pubkey. Other kind-30078 data is unaffected. Off by default.
+
 ## Config file & hot-reload
 
 Set `RL_CONFIG_FILE=/path/to/strfry-ratelimit.conf` to load settings from a file instead of
 environment variables. The file is `key = value` (`#` starts a comment); keys are the env names
 **without** the `RL_` prefix, lowercased — e.g. `window_seconds`, `max_events`, `block_kinds`,
-`block_ephemeral_sources`, `exempt_rate_limit_sources`, `ban_list_file`. See [`examples/strfry-ratelimit.conf`](examples/strfry-ratelimit.conf).
+`block_ephemeral_sources`, `exempt_rate_limit_sources`, `count_max_age_seconds`, `ban_list_file`. See [`examples/strfry-ratelimit.conf`](examples/strfry-ratelimit.conf).
 
 The plugin **re-reads the config file and the banlist when they change (by mtime)**, so you can
 adjust blocked kinds/sources, rate limits, exemptions, and bans/unbans **without restarting strfry**.
