@@ -229,7 +229,7 @@ arrival_unix.ms  source_ip  event_id  pubkey  kind  created_at  request_bytes  a
 
 Rejected events are included, so it also shows who was blocked and why. Ephemeral events
 dropped by `block_ephemeral_sources` are not logged (they are a configured upstream's
-firehose and are already summarized in stderr). Event content is
+firehose and are already summarized in stderr); kinds dropped by `block_source_kinds` are logged. Event content is
 not stored (the relay already has it). Writing is best-effort and never changes a verdict.
 `scripts/audit-compact.sh <dir> [days]` gzips finished days and deletes ones older than
 `days` (default 90); run it daily from cron/launchd.
@@ -282,7 +282,7 @@ upstream URLs) are also never counted or banned.
 Set `RL_CONFIG_FILE=/path/to/strfry-ratelimit.conf` to load settings from a file instead of
 environment variables. The file is `key = value` (`#` starts a comment); keys are the env names
 **without** the `RL_` prefix, lowercased — e.g. `window_seconds`, `max_events`, `block_kinds`,
-`block_ephemeral_sources`, `exempt_rate_limit_sources`, `count_max_age_seconds`, `ban_list_file`, `source_max_events`. See [`examples/strfry-ratelimit.conf`](examples/strfry-ratelimit.conf).
+`block_ephemeral_sources`, `block_source_kinds`, `exempt_rate_limit_sources`, `count_max_age_seconds`, `ban_list_file`, `source_max_events`. See [`examples/strfry-ratelimit.conf`](examples/strfry-ratelimit.conf).
 
 The plugin **re-reads the config file and the banlist when they change (by mtime)**, so you can
 adjust blocked kinds/sources, rate limits, exemptions, and bans/unbans **without restarting strfry**.

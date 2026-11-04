@@ -195,6 +195,53 @@ fn blocks_ephemeral_only_from_configured_sources() {
 }
 
 #[test]
+fn blocks_configured_kinds_only_from_configured_sources() {
+    let mut p = Plugin::start(&[
+        (
+            "RL_BLOCK_EPHEMERAL_SOURCES",
+            "149.28.29.200, 2001:19f0:7002:191:0:bad:c0de:1337",
+        ),
+        ("RL_BLOCK_SOURCE_KINDS", "4, 1059"),
+        ("RL_BLOCK_SOURCE_MODE", "shadow"),
+        ("RL_MAX_EVENTS", "1000000"),
+    ]);
+    // Forwarded DMs from the configured upstream are dropped (both address families).
+    let v4 = p.send_raw_from("01", PK_A, 1059, "149.28.29.200");
+    assert!(v4.contains("\"action\":\"shadowReject\""), "{v4}");
+    let v6 = p.send_raw_from("02", PK_A, 4, "2001:19f0:7002:191:0:bad:c0de:1337");
+    assert!(v6.contains("\"action\":\"shadowReject\""), "{v6}");
+    // Ephemeral blocking from that source is unchanged.
+    let eph = p.send_raw_from("03", PK_A, 27889, "149.28.29.200");
+    assert!(eph.contains("\"action\":\"shadowReject\""), "{eph}");
+    // Other kinds from the upstream still pass.
+    assert_eq!(p.send_from("04", PK_A, 1, "149.28.29.200"), Verdict::Accept);
+    assert_eq!(p.send_from("05", PK_A, 1060, "149.28.29.200"), Verdict::Accept);
+    // DMs sent directly by clients still pass.
+    assert_eq!(p.send_from("06", PK_A, 1059, "203.0.113.10"), Verdict::Accept);
+    assert_eq!(p.send_from("07", PK_A, 4, "203.0.113.10"), Verdict::Accept);
+    assert_eq!(p.send_from("08", PK_A, 1059, ""), Verdict::Accept);
+}
+
+#[test]
+fn source_kinds_without_sources_block_nothing() {
+    let mut p = Plugin::start(&[("RL_BLOCK_SOURCE_KINDS", "1059"), ("RL_MAX_EVENTS", "1000000")]);
+    assert_eq!(p.send_from("01", PK_A, 1059, "149.28.29.200"), Verdict::Accept);
+}
+
+#[test]
+fn source_blocked_kind_reject_reason_names_the_kind_rule() {
+    let mut p = Plugin::start(&[
+        ("RL_BLOCK_EPHEMERAL_SOURCES", "149.28.29.200"),
+        ("RL_BLOCK_SOURCE_KINDS", "1059"),
+    ]);
+    let line = p.send_raw_from("01", PK_A, 1059, "149.28.29.200");
+    assert!(line.contains("\"action\":\"reject\""), "{line}");
+    assert!(line.contains("blocked: this kind is not accepted from this source"), "{line}");
+    let eph = p.send_raw_from("02", PK_A, 27889, "149.28.29.200");
+    assert!(eph.contains("blocked: ephemeral events from this source"), "{eph}");
+}
+
+#[test]
 fn blocked_source_defaults_to_explicit_reject() {
     let mut p = Plugin::start(&[("RL_BLOCK_EPHEMERAL_SOURCES", "149.28.29.200")]);
     let line = p.send_raw_from("01", PK_A, 27889, "149.28.29.200");

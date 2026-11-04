@@ -42,6 +42,10 @@ struct Config {
     /// operator to suppress ephemeral forwarding from one upstream/source without disabling
     /// ephemeral events for direct clients or other relays.
     block_ephemeral_sources: HashSet<String>,
+    /// Kinds (beyond ephemeral) blocked when they arrive from a `block_ephemeral_sources` source,
+    /// e.g. gift-wrapped DMs forwarded by an upstream relay. Direct clients are unaffected.
+    block_source_singles: Vec<u64>,
+    block_source_ranges: Vec<(u64, u64)>,
     /// `true` returns shadowReject for a blocked source; `false` returns an explicit rejection.
     block_source_shadow: bool,
     /// Exact writePolicy sourceInfo values excluded from the per-pubkey sliding window. These
@@ -385,6 +389,8 @@ impl Config {
                     .collect()
             })
             .unwrap_or_default();
+        let (block_source_singles, block_source_ranges) =
+            parse_kind_list(&get("block_source_kinds").unwrap_or_default());
         let block_source_shadow = match get("block_source_mode")
             .map(|m| m.trim().to_ascii_lowercase())
         {
@@ -417,6 +423,8 @@ impl Config {
             block_singles,
             block_ranges,
             block_ephemeral_sources,
+            block_source_singles,
+            block_source_ranges,
             block_source_shadow,
             exempt_rate_limit_sources,
             count_max_age_seconds: u64_of("count_max_age_seconds", 0),
@@ -479,7 +487,12 @@ impl Config {
                 .any(|&(lo, hi)| lo <= kind && kind <= hi)
     }
     fn blocks_ephemeral_source(&self, kind: u64, source: &str) -> bool {
-        is_ephemeral(kind)
+        (is_ephemeral(kind)
+            || self.block_source_singles.contains(&kind)
+            || self
+                .block_source_ranges
+                .iter()
+                .any(|&(lo, hi)| lo <= kind && kind <= hi))
             && !source.is_empty()
             && self
                 .block_ephemeral_sources
@@ -760,9 +773,9 @@ fn main() {
         banned_sources.len()
     );
     eprintln!(
-        "strfry-ratelimit: source={} window={}s max={} banOnExceed={} blockSingles={:?} blockRanges={:?} blockEphemeralSources={:?} blockSourceMode={} exemptRateLimitSources={:?} countMaxAge={}s fileChunk={:?} buildPublish={} excludeKinds={:?} exempt(eph={},repl={},addr={}) ephemeralCeiling={} totalCeiling={} ceilingMode={} banned_loaded={}",
+        "strfry-ratelimit: source={} window={}s max={} banOnExceed={} blockSingles={:?} blockRanges={:?} blockEphemeralSources={:?} blockSourceKinds={:?}{:?} blockSourceMode={} exemptRateLimitSources={:?} countMaxAge={}s fileChunk={:?} buildPublish={} excludeKinds={:?} exempt(eph={},repl={},addr={}) ephemeralCeiling={} totalCeiling={} ceilingMode={} banned_loaded={}",
         cfg_path.as_deref().unwrap_or("env"), cfg.window_seconds, cfg.max_events, cfg.ban_on_exceed,
-        cfg.block_singles, cfg.block_ranges, cfg.block_ephemeral_sources,
+        cfg.block_singles, cfg.block_ranges, cfg.block_ephemeral_sources, cfg.block_source_singles, cfg.block_source_ranges,
         if cfg.block_source_shadow { "shadow" } else { "reject" }, cfg.exempt_rate_limit_sources, cfg.count_max_age_seconds, cfg.file_chunk_action, cfg.block_build_publish, cfg.exclude_kinds,
         cfg.exempt_ephemeral, cfg.exempt_replaceable, cfg.exempt_addressable,
         if cfg.ephemeral_rate_per_sec > 0.0 {
@@ -824,8 +837,10 @@ fn main() {
                             source_ban_mtime = source_ban_path.as_deref().and_then(mtime);
                         }
                         eprintln!(
-                            "strfry-ratelimit: reloaded config from {p} (blockEphemeralSources={:?} blockSourceMode={} exemptRateLimitSources={:?} ephemeralCeiling={} totalCeiling={} ceilingMode={})",
+                            "strfry-ratelimit: reloaded config from {p} (blockEphemeralSources={:?} blockSourceKinds={:?}{:?} blockSourceMode={} exemptRateLimitSources={:?} ephemeralCeiling={} totalCeiling={} ceilingMode={})",
                             cfg.block_ephemeral_sources,
+                            cfg.block_source_singles,
+                            cfg.block_source_ranges,
                             if cfg.block_source_shadow { "shadow" } else { "reject" },
                             cfg.exempt_rate_limit_sources,
                             if cfg.ephemeral_rate_per_sec > 0.0 {
@@ -925,12 +940,19 @@ fn main() {
                 } else {
                     (
                         "reject",
-                        "blocked: ephemeral events from this source are not accepted",
+                        if is_ephemeral(k) {
+                            "blocked: ephemeral events from this source are not accepted"
+                        } else {
+                            "blocked: this kind is not accepted from this source"
+                        },
                     )
                 };
-                // Not audited: a configured upstream's ephemeral firehose is high-volume, already
-                // summarized by source_block_meter, and attributes nothing to an end user.
-                respond(&mut out, &mut audit, &None, &ctx, id, action, msg);
+                // Ephemeral drops are not audited: a configured upstream's ephemeral firehose is
+                // high-volume, already summarized by source_block_meter, and attributes nothing to
+                // an end user. Other source-blocked kinds (e.g. forwarded DMs) are low-volume and
+                // audited so the effect of the block stays visible.
+                let audit_dir = if is_ephemeral(k) { &None } else { &cfg.audit_log_dir };
+                respond(&mut out, &mut audit, audit_dir, &ctx, id, action, msg);
                 continue;
             }
         }
